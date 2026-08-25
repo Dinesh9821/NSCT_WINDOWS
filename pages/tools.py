@@ -18,11 +18,12 @@ from core.theme import theme
 from core import iconkit
 from core.workers import WorkerManager
 from backend.diagnostics import (
-    run_ping, run_traceroute, run_command,
+    run_command,
     check_ip_type, check_internet, check_default_gateway, check_dns_servers,
     check_dhcp_status, check_zscaler, get_ip_location, get_public_ip
 )
 from backend.chatbot import send_to_llm
+from backend.network_verify import run_verified_ping, run_verified_traceroute
 
 
 class ToolsPage(QWidget):
@@ -217,12 +218,12 @@ class ToolsPage(QWidget):
     def _do_ping(self):
         target = self.txt_ip.text().strip()
         prompt = "As a Network administrator analyze this ping output. Is there a network issue?\n{out}"
-        self._execute_pipeline(run_ping, [target], prompt, f"Ping {target}")
+        self._execute_pipeline(run_verified_ping, [target], prompt, f"Ping {target}")
 
     def _do_trace(self):
         target = self.txt_ip.text().strip()
         prompt = "Give me a one-liner analysis of this traceroute output:\n{out}"
-        self._execute_pipeline(run_traceroute, [target], prompt, f"Traceroute {target}")
+        self._execute_pipeline(run_verified_traceroute, [target], prompt, f"Traceroute {target}")
 
     def _do_exec(self):
         cmd = self.txt_cmd.text().strip()

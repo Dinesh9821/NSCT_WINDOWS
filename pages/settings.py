@@ -18,7 +18,9 @@ from PySide6.QtCore import Qt
 from core.theme import theme, apply_soft_shadow
 from core import iconkit
 from core.constants import (
-    APP_NAME, APP_VERSION, VENDOR, LLM_API_URL, USERNAME, log_dir
+    APP_NAME, APP_VERSION, VENDOR, LLM_API_URL, USERNAME, log_dir,
+    VERIFY_API_URL, VERIFY_API_TIMEOUT, PACKET_CAPTURE_TIMEOUT, capture_dir,
+    PCAP_RETENTION,
 )
 from backend.diagnostics import get_ad_username, get_local_ip, uptime_short
 
@@ -49,6 +51,13 @@ class SettingsPage(QWidget):
             ("LLM Endpoint", LLM_API_URL),
             ("Auth User", USERNAME),
             ("Auth Secret", "•" * 8),
+        ])
+        self._build_card("Packet capture & verification", [
+            ("Verification API", VERIFY_API_URL or "(not configured)"),
+            ("API timeout", "{} s".format(VERIFY_API_TIMEOUT)),
+            ("Capture timeout", "{} s".format(PACKET_CAPTURE_TIMEOUT)),
+            ("Capture folder", capture_dir()),
+            ("PCAP retention", "{} files".format(PCAP_RETENTION)),
         ])
         self._build_card("System", [
             ("Hostname", socket.gethostname()),
