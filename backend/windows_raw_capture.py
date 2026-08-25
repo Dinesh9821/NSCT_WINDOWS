@@ -13,10 +13,11 @@ What Windows *does* allow without any third-party capture product:
       echo request/reply, DNS, …). Link-layer (Ethernet) headers are not
       present. Wireshark opens the file as Raw IP (LINKTYPE_RAW = 101).
 
+IPv6 SIO_RCVALL does not return IPv6 headers (Microsoft documented limit).
+
 This module never synthesizes packets. If the raw socket cannot be opened,
 it fails and the caller writes an empty valid pcapng plus an error.
 """
-
 from __future__ import annotations
 
 import logging
@@ -25,12 +26,16 @@ import struct
 import threading
 import time
 
+from core.constants import CAPTURE_MAX_PACKETS
+
 log = logging.getLogger("NetworkAI.WindowsRaw")
 
-# Winsock ioctl values (also provided as socket.SIO_RCVALL on Windows).
 SIO_RCVALL = getattr(socket, "SIO_RCVALL", 0x98000001)
 RCVALL_ON = getattr(socket, "RCVALL_ON", 1)
 RCVALL_OFF = getattr(socket, "RCVALL_OFF", 0)
+RCVALL_IPLEVEL = getattr(socket, "RCVALL_IPLEVEL", 3)
+WSAEACCES = 10013
+SO_RCVBUF_BYTES = 8 * 1024 * 1024
 
 
 def ip_datagram_match(datagram, dest_ip=None, protocol=None, port=None):
@@ -74,26 +79,37 @@ class WindowsRawCapture:
         self.sock = None
         self._stop = threading.Event()
         self._thread = None
+        self._lock = threading.Lock()
         self.frames = []
         self.error = None
+        self.max_packets = max(1, int(CAPTURE_MAX_PACKETS or 50000))
 
     def start(self):
         if not self.local_ip or self.local_ip in ("—", "127.0.0.1", "::1"):
-            # Loopback is not reliably visible via SIO_RCVALL.
             raise PermissionError(
                 "Windows raw capture needs a real interface IPv4 address "
                 "(loopback is not supported by SIO_RCVALL)."
             )
         sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
         try:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SO_RCVBUF_BYTES)
+            except OSError:
+                pass
             sock.bind((self.local_ip, 0))
-            sock.ioctl(SIO_RCVALL, RCVALL_ON)
+            self._enable_rcvall(sock)
             sock.settimeout(0.25)
-        except OSError:
+        except OSError as exc:
             try:
                 sock.close()
             except Exception:
                 pass
+            winerr = getattr(exc, "winerror", None) or getattr(exc, "errno", None)
+            if winerr == WSAEACCES:
+                raise PermissionError(
+                    "SIO_RCVALL requires Administrator. "
+                    "Right-click the app → Run as administrator."
+                ) from exc
             raise
         self.sock = sock
         self._stop.clear()
@@ -108,14 +124,31 @@ class WindowsRawCapture:
                     continue
                 except OSError:
                     break
-                if ip_datagram_match(data, self.dest_ip, self.protocol, self.port):
-                    self.frames.append((time.time(), data))
+                if not ip_datagram_match(data, self.dest_ip, self.protocol, self.port):
+                    continue
+                frame = (time.time(), bytes(data))
+                with self._lock:
+                    if len(self.frames) >= self.max_packets:
+                        break
+                    self.frames.append(frame)
 
         self._thread = threading.Thread(target=_loop, name="windows-raw-capture", daemon=True)
         self._thread.start()
-        log.info("Windows SIO_RCVALL capture started on %s filter dest=%s proto=%s port=%s",
-                 self.local_ip, self.dest_ip, self.protocol, self.port)
+        log.info(
+            "Windows SIO_RCVALL capture started on %s filter dest=%s proto=%s port=%s",
+            self.local_ip, self.dest_ip, self.protocol, self.port,
+        )
         return True
+
+    def _enable_rcvall(self, sock):
+        last = None
+        for mode in (RCVALL_ON, RCVALL_IPLEVEL):
+            try:
+                sock.ioctl(SIO_RCVALL, mode)
+                return
+            except OSError as exc:
+                last = exc
+        raise last
 
     def stop(self):
         self._stop.set()
@@ -133,5 +166,7 @@ class WindowsRawCapture:
         if self._thread is not None:
             self._thread.join(timeout=5)
             self._thread = None
-        log.info("Windows SIO_RCVALL capture stopped packets=%s", len(self.frames))
-        return list(self.frames)
+        with self._lock:
+            frames = list(self.frames)
+        log.info("Windows SIO_RCVALL capture stopped packets=%s", len(frames))
+        return frames

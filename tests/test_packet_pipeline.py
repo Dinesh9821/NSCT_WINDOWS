@@ -344,6 +344,38 @@ class CaptureUnavailableTests(unittest.TestCase):
         st = capture_status()
         self.assertIn("dumpcap", st)
         self.assertIn("capture_dir", st)
+        self.assertIn("preferred_backend", st)
+        self.assertFalse(st["third_party_required"])
+
+
+class PktmonArgTests(unittest.TestCase):
+    def test_filter_and_etl2pcap_argv(self):
+        from pathlib import Path
+        from backend.windows_pktmon import build_filter_args, etl2pcap_commands
+
+        self.assertEqual(
+            build_filter_args("8.8.8.8", 443, "TCP"),
+            ["-i", "8.8.8.8", "-p", "443", "-t", "TCP"],
+        )
+        self.assertEqual(
+            build_filter_args("8.8.8.8", 0, "ICMP"),
+            ["-i", "8.8.8.8", "-t", "ICMP"],
+        )
+        self.assertIsNone(build_filter_args("google.com", 443, "TCP"))
+        self.assertIsNone(build_filter_args("8.8.8.8; rm", 443, "TCP"))
+        cmds = etl2pcap_commands("pktmon", Path("a.etl"), Path("a.pcapng"))
+        self.assertEqual(cmds[0][:2], ["pktmon", "etl2pcap"])
+        self.assertIn("--out", cmds[0])
+
+
+class ElevateTests(unittest.TestCase):
+    def test_non_windows_relaunch_rejected(self):
+        from backend.windows_elevate import relaunch_as_admin, is_windows
+        if is_windows():
+            self.skipTest("Windows host")
+        ok, err = relaunch_as_admin()
+        self.assertFalse(ok)
+        self.assertIn("Windows", err)
 
 
 class ReportTests(unittest.TestCase):

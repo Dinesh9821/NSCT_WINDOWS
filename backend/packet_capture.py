@@ -1,20 +1,21 @@
 """
 Self-contained packet capture for the NSCT app.
 
-Windows (no Wireshark / Npcap / dumpcap / tshark required):
-  1. SOCK_RAW + SIO_RCVALL — in-process IP datagram capture (Administrator)
-  2. pktmon — Windows inbox packet monitor (Administrator), converted to pcapng
-     by Windows itself, then we keep the file. Not a third-party product.
+Windows (no Wireshark / Npcap / dumpcap / tshark required at runtime):
+  1. pktmon — inbox PktMon.sys (Administrator). ETL is converted with
+     ``pktmon etl2pcap``. Full frames when the OS supports it.
+  2. SOCK_RAW + SIO_RCVALL — in-process IPv4 datagram capture (Administrator).
+     No Ethernet header; Wireshark LINKTYPE_RAW.
 
 Unix (this repo's CI / macOS):
   AF_PACKET or tcpdump when the OS provides them.
 
-PCAP/PCAPNG is always written by backend.pcap_io (stdlib). Packets are never
-synthesized from ping/connect output.
+PCAP/PCAPNG is always written by backend.pcap_io (stdlib) except when pktmon
+writes a native pcapng via etl2pcap. Packets are never synthesized from
+ping/connect output.
 
 Limitation (Windows): Ethernet/L2 sniffing of a NIC requires an NDIS filter
 driver. Microsoft does not expose that to user-mode without such a driver.
-SIO_RCVALL captures real IPv4 datagrams (TCP/UDP/ICMP) seen by this host.
 """
 
 from __future__ import annotations
@@ -221,6 +222,7 @@ class PacketCapture:
         self._etl = None
         self._linktype = 101 if IS_WINDOWS else 1  # Raw IP on Windows SIO_RCVALL
         self._raw_engine = None
+        self._pktmon_engine = None
 
     def start(self):
         log.info("Capture started path=%s filter=%s iface=%s src=%s admin=%s",
@@ -229,8 +231,8 @@ class PacketCapture:
         backends = []
         if IS_WINDOWS:
             backends.extend([
-                ("windows_raw", self._start_windows_raw),
                 ("pktmon", self._start_pktmon),
+                ("windows_raw", self._start_windows_raw),
             ])
             # Opt-in only: third-party NDIS drivers are not a runtime requirement.
             if os.environ.get("NETWORKAI_ALLOW_NPCAP") == "1":
@@ -335,7 +337,8 @@ class PacketCapture:
                 "Packet capture unavailable. This build does not use Wireshark, "
                 "Npcap, dumpcap, or tshark. On Windows, real IP datagrams are "
                 "observed with a raw socket (SIO_RCVALL) or inbox pktmon, both "
-                "of which require Administrator. The process is elevated: %s. "
+                "of which require Administrator. This process is elevated: %s. "
+                "Use Restart as Administrator on Server Test if that is False. "
                 "Ethernet-level sniffing of a NIC is not possible in user mode "
                 "without an NDIS filter driver (a Windows architectural limit). "
                 "Network diagnostics will continue; the PCAP may be empty."
@@ -545,54 +548,39 @@ class PacketCapture:
         except Exception:
             pass
 
-    # ----- pktmon (Windows) -----------------------------------------------
+    # ----- pktmon (Windows inbox PktMon.sys) ------------------------------
     def _start_pktmon(self):
-        exe = pktmon_path()
-        if not exe:
+        from pathlib import Path
+        from backend.windows_pktmon import WindowsPktmonCapture
+
+        if not IS_WINDOWS:
             return False
         if not is_windows_admin():
             log.info("Skipping pktmon (Access denied unless the app is Run as Administrator)")
             return False
-        self._etl = self.path + ".etl"
-        # Reset filters (best-effort); ignore failures.
-        _run_hidden([exe, "filter", "remove"])
-        filt = [exe, "filter", "add"]
-        if self.dest_ip and _valid_ip(self.dest_ip):
-            if ":" in self.dest_ip:
-                filt.extend(["--ipv6", self.dest_ip])
-            else:
-                filt.extend(["-i", self.dest_ip])
-        proto = self.protocol
-        if proto in ("TCP", "UDP", "ICMP"):
-            filt.extend(["-t", proto])
-        if _valid_port(self.port) and proto in ("TCP", "UDP"):
-            filt.extend(["-p", str(int(self.port))])
-        code, _o, err = _run_hidden(filt, timeout=15)
-        if code not in (0, None) and b"error" in (err or b"").lower():
-            log.warning("pktmon filter add: %s", err[:300])
-        args = [exe, "start", "--capture", "--pkt-size", "0", "--file-name", self._etl]
-        code, _o, err = _run_hidden(args, timeout=15)
-        if code != 0:
-            log.info("pktmon start failed (%s): %s", code, (err or b"")[:300])
-            _run_hidden([exe, "stop"], timeout=10)
+        engine = WindowsPktmonCapture(
+            Path(self.path),
+            self.dest_ip or "",
+            int(self.port or 0),
+            self.protocol or "TCP",
+        )
+        ok, err = engine.start()
+        if not ok:
+            log.info("pktmon start skipped/failed: %s", err)
             return False
+        self._pktmon_engine = engine
+        self._linktype = 1
         return True
 
     def _stop_pktmon(self):
-        exe = pktmon_path()
-        if exe:
-            _run_hidden([exe, "stop"], timeout=20)
-            etl = self._etl
-            if etl and os.path.isfile(etl):
-                code, _o, err = _run_hidden(
-                    [exe, "pcapng", etl, "-o", self.path], timeout=30)
-                if code != 0:
-                    log.warning("pktmon pcapng convert failed: %s", (err or b"")[:300])
-                try:
-                    os.remove(etl)
-                except OSError:
-                    pass
-            _run_hidden([exe, "filter", "remove"], timeout=10)
+        engine = self._pktmon_engine
+        self._pktmon_engine = None
+        if engine is None:
+            return
+        _size, err = engine.stop_and_convert()
+        if err:
+            log.warning("pktmon convert: %s", err)
+            self.error = err
 
     # ----- AF_PACKET / raw (userspace filter) -----------------------------
     def _start_afpacket(self):
@@ -704,14 +692,23 @@ def _userspace_match(frame, dest_ip, protocol, port, source_ip):
 
 def capture_status():
     """Lightweight capability probe for Settings / error messages."""
+    pktmon = bool(pktmon_path())
+    admin = is_windows_admin()
     return {
         "npcap": npcap_installed(),
         "dumpcap": bool(dumpcap_path()),
-        "pktmon": bool(pktmon_path()),
+        "pktmon": pktmon,
         "tcpdump": bool(tcpdump_path()),
         "interface": detect_interface(),
         "capture_dir": capture_dir(),
         "windows": IS_WINDOWS,
-        "admin": is_windows_admin(),
+        "admin": admin,
         "dumpcap_path": dumpcap_path(),
+        "preferred_backend": (
+            "pktmon" if (IS_WINDOWS and admin and pktmon)
+            else "windows_raw" if (IS_WINDOWS and admin)
+            else "none (run as Administrator)" if IS_WINDOWS
+            else "afpacket/tcpdump"
+        ),
+        "third_party_required": False,
     }

@@ -181,10 +181,18 @@ class ServerTestPage(QWidget):
         iconkit.button(self.btn_caps, "fa5s.folder-open", role="ACCENT", size=14)
         self.btn_caps.clicked.connect(self._open_captures)
         row.addWidget(self.btn_caps)
+        self.btn_admin = QPushButton("  Restart as Administrator")
+        self.btn_admin.setProperty("cls", "ghost")
+        self.btn_admin.setFixedHeight(44)
+        self.btn_admin.setCursor(Qt.PointingHandCursor)
+        iconkit.button(self.btn_admin, "fa5s.lock", role="ACCENT", size=14)
+        self.btn_admin.clicked.connect(self._restart_admin)
+        row.addWidget(self.btn_admin)
         row.addStretch()
         lay.addLayout(row)
 
         self.body.addWidget(frame)
+        self._refresh_admin_hint()
 
     def _build_summary(self):
         frame, lay = self._card("VERDICT")
@@ -469,3 +477,26 @@ class ServerTestPage(QWidget):
                 subprocess.Popen(["xdg-open", path])
         except Exception:
             self.lbl_detail.setText("Capture folder: {}".format(path))
+
+    def _refresh_admin_hint(self):
+        from backend.windows_elevate import is_admin, is_windows
+        if not is_windows():
+            self.btn_admin.setVisible(False)
+            return
+        elevated = is_admin()
+        self.btn_admin.setVisible(not elevated)
+        if elevated:
+            self.lbl_source.setText("Source: {}  ·  Administrator (pktmon / SIO_RCVALL)".format(get_local_ip()))
+        else:
+            self.lbl_source.setText(
+                "Source: {}  ·  Not elevated — capture needs Administrator".format(get_local_ip())
+            )
+
+    def _restart_admin(self):
+        from backend.windows_elevate import relaunch_as_admin
+        ok, err = relaunch_as_admin()
+        if ok:
+            from PySide6.QtWidgets import QApplication
+            QApplication.quit()
+            return
+        self.lbl_detail.setText(err or "Could not restart as Administrator.")
