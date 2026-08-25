@@ -1,17 +1,20 @@
 """
-Windows-first live packet capture.
+Self-contained packet capture for the NSCT app.
 
-Capture begins before the diagnostic and is always stopped in a finally
-block. Backends (in preference order):
+Windows (no Wireshark / Npcap / dumpcap / tshark required):
+  1. SOCK_RAW + SIO_RCVALL — in-process IP datagram capture (Administrator)
+  2. pktmon — Windows inbox packet monitor (Administrator), converted to pcapng
+     by Windows itself, then we keep the file. Not a third-party product.
 
-  1. dumpcap  (Wireshark/Npcap) — native pcapng
-  2. pktmon   (Windows 10+)     — ETL converted to pcapng
-  3. tcpdump                    — pcap/pcapng on Unix
-  4. AF_PACKET / NDIS raw       — stdlib sockets + our pcapng writer
-  5. scapy                      — only if already installed
+Unix (this repo's CI / macOS):
+  AF_PACKET or tcpdump when the OS provides them.
 
-No extra Python package is required. Missing Npcap/privileges is reported
-without crashing the application.
+PCAP/PCAPNG is always written by backend.pcap_io (stdlib). Packets are never
+synthesized from ping/connect output.
+
+Limitation (Windows): Ethernet/L2 sniffing of a NIC requires an NDIS filter
+driver. Microsoft does not expose that to user-mode without such a driver.
+SIO_RCVALL captures real IPv4 datagrams (TCP/UDP/ICMP) seen by this host.
 """
 
 from __future__ import annotations
@@ -30,7 +33,7 @@ import subprocess
 import psutil
 
 from core.constants import PACKET_CAPTURE_TIMEOUT, CAPTURE_INTERFACE, capture_dir
-from backend.pcap_io import write_pcapng, file_magic_ok, packet_count, empty_pcapng
+from backend.pcap_io import write_pcapng, file_magic_ok, packet_count, empty_pcapng, LINKTYPE_RAW
 from backend.diagnostics import get_local_ip, _no_window_kwargs, IS_WINDOWS
 
 log = logging.getLogger("NetworkAI.Capture")
@@ -216,21 +219,32 @@ class PacketCapture:
         self._stop = threading.Event()
         self._frames = []
         self._etl = None
-        self._linktype = 1
+        self._linktype = 101 if IS_WINDOWS else 1  # Raw IP on Windows SIO_RCVALL
+        self._raw_engine = None
 
     def start(self):
-        log.info("Capture started path=%s filter=%s iface=%s dumpcap=%s npcap=%s admin=%s",
-                 self.path, self.filter, self.interface, dumpcap_path() or "(not found)",
-                 npcap_installed(), is_windows_admin())
+        log.info("Capture started path=%s filter=%s iface=%s src=%s admin=%s",
+                 self.path, self.filter, self.interface, self.source_ip, is_windows_admin())
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        for name, fn in (
-            ("dumpcap", self._start_dumpcap),
-            ("npcap", self._start_npcap),
-            ("scapy", self._start_scapy),
-            ("pktmon", self._start_pktmon),
-            ("tcpdump", self._start_tcpdump),
-            ("afpacket", self._start_afpacket),
-        ):
+        backends = []
+        if IS_WINDOWS:
+            backends.extend([
+                ("windows_raw", self._start_windows_raw),
+                ("pktmon", self._start_pktmon),
+            ])
+            # Opt-in only: third-party NDIS drivers are not a runtime requirement.
+            if os.environ.get("NETWORKAI_ALLOW_NPCAP") == "1":
+                backends.extend([
+                    ("dumpcap", self._start_dumpcap),
+                    ("npcap", self._start_npcap),
+                    ("scapy", self._start_scapy),
+                ])
+        else:
+            backends.extend([
+                ("afpacket", self._start_afpacket),
+                ("tcpdump", self._start_tcpdump),
+            ])
+        for name, fn in backends:
             try:
                 if fn():
                     self.backend = name
@@ -256,6 +270,16 @@ class PacketCapture:
                 self._stop_proc()
             elif self.backend == "pktmon":
                 self._stop_pktmon()
+            elif self.backend == "windows_raw":
+                engine = getattr(self, "_raw_engine", None)
+                if engine is not None:
+                    self._frames = engine.stop()
+                    self._raw_engine = None
+                    self._thread = None
+                try:
+                    write_pcapng(self.path, list(self._frames), linktype=self._linktype or LINKTYPE_RAW)
+                except Exception:
+                    log.exception("failed to write pcapng")
             elif self.backend in ("afpacket", "scapy", "npcap"):
                 self._stop.set()
                 if self._thread:
@@ -306,26 +330,43 @@ class PacketCapture:
 
     def _unavailable_message(self):
         if IS_WINDOWS:
-            np = "installed" if npcap_installed() else "not installed"
-            dc = dumpcap_path()
             admin = is_windows_admin()
-            extra = []
-            if not dc:
-                extra.append("Wireshark dumpcap.exe was not found (Npcap alone is not dumpcap).")
-            if npcap_installed() and not admin:
-                extra.append(
-                    "If capture still fails, Npcap was likely installed with "
-                    "'Restrict Npcap driver's access to Administrators only' — "
-                    "reinstall Npcap with that box unchecked, or Run as Administrator."
-                )
             return (
-                "Packet capture unavailable. Npcap is %s. Administrator=%s. %s "
-                "Network diagnostics will continue."
-            ) % (np, admin, " ".join(extra))
+                "Packet capture unavailable. This build does not use Wireshark, "
+                "Npcap, dumpcap, or tshark. On Windows, real IP datagrams are "
+                "observed with a raw socket (SIO_RCVALL) or inbox pktmon, both "
+                "of which require Administrator. The process is elevated: %s. "
+                "Ethernet-level sniffing of a NIC is not possible in user mode "
+                "without an NDIS filter driver (a Windows architectural limit). "
+                "Network diagnostics will continue; the PCAP may be empty."
+            ) % admin
         return (
             "Packet capture unavailable (permission or backend missing). "
             "Install tcpdump or run with CAP_NET_RAW. Diagnostics will continue."
         )
+
+    def _start_windows_raw(self):
+        if not IS_WINDOWS:
+            return False
+        from backend.windows_raw_capture import WindowsRawCapture
+        cap = WindowsRawCapture(
+            self.source_ip, dest_ip=self.dest_ip, protocol=self.protocol,
+            port=self.port, timeout=self.timeout)
+        try:
+            cap.start()
+        except PermissionError as e:
+            log.info("Windows raw capture not permitted: %s", e)
+            return False
+        except OSError as e:
+            log.info("Windows raw capture socket failed: %s", e)
+            return False
+        self._raw_engine = cap
+        self._stop.clear()
+        self._frames = cap.frames
+        self._linktype = LINKTYPE_RAW
+        # Reader thread lives inside WindowsRawCapture.
+        self._thread = cap._thread
+        return True
 
     def _pcap_device(self):
         """Npcap/dumpcap device name (\\Device\\NPF_{GUID}), not 'Wi-Fi'."""

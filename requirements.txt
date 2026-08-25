@@ -6,8 +6,9 @@ requests>=2.31
 pyvis>=0.3.2           # pulls in networkx, jinja2, jsonpickle
 fpdf2>=2.7             # PDF export of the diagnostic report
 
-# Packet capture uses stdlib + OS tools (dumpcap / pktmon / tcpdump / AF_PACKET).
-# No extra Python package is required. Optional if already present:
-#   scapy     — used only when Npcap/libpcap sniffing via scapy is installed
-#   Wireshark/Npcap or Windows pktmon — required on Windows for live frames
+# Packet capture is self-contained:
+#   Windows — stdlib SOCK_RAW + SIO_RCVALL (Administrator) writes pcapng via
+#             backend/pcap_io.py. Optional fallback: inbox `pktmon` (also Admin).
+#   No Wireshark, Npcap, dumpcap, or tshark is required at runtime.
+#   Ethernet/L2 sniffing without an NDIS driver is not possible on Windows.
 

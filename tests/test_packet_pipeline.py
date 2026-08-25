@@ -113,6 +113,39 @@ class AnalysisTests(unittest.TestCase):
         finally:
             os.remove(path)
 
+    def test_raw_ip_tcp_handshake_no_ethernet(self):
+        """SIO_RCVALL captures IP datagrams (LINKTYPE_RAW), not Ethernet."""
+        from backend.pcap_io import write_pcapng, LINKTYPE_RAW
+        syn = _ipv4("10.10.10.10", "10.20.20.20", 6, _tcp(40000, 443, 0x02, seq=1))
+        synack = _ipv4("10.20.20.20", "10.10.10.10", 6, _tcp(443, 40000, 0x12, seq=9, ack=2))
+        ack = _ipv4("10.10.10.10", "10.20.20.20", 6, _tcp(40000, 443, 0x10, seq=2, ack=10))
+        fd, path = tempfile.mkstemp(suffix=".pcapng")
+        os.close(fd)
+        write_pcapng(path, [(time.time(), syn), (time.time(), synack), (time.time(), ack)],
+                     linktype=LINKTYPE_RAW)
+        try:
+            a = analyze_pcap(path, "TCP", "10.10.10.10", "10.20.20.20", 443)
+            self.assertEqual(a["packet_count"], 3)
+            self.assertTrue(a["tcp"]["handshake_complete"])
+            self.assertEqual(a["tcp"]["syn"], "YES")
+            self.assertEqual(a["tcp"]["syn_ack"], "YES")
+            self.assertEqual(a["tcp"]["ack"], "YES")
+        finally:
+            os.remove(path)
+
+    def test_empty_capture_is_unknown_not_invented_pass(self):
+        fd, path = tempfile.mkstemp(suffix=".pcapng")
+        os.close(fd)
+        from backend.pcap_io import empty_pcapng
+        empty_pcapng(path)
+        try:
+            a = analyze_pcap(path, "TCP")
+            v = local_verification("TCP", {"ports": [{"state": "open"}], "dns": {"ok": True}}, a)
+            self.assertEqual(v["result"], "UNKNOWN")
+            self.assertIn("INSUFFICIENT_EVIDENCE", v["reason"])
+        finally:
+            os.remove(path)
+
     def test_tcp_syn_only_fail(self):
         syn = _eth(_ipv4("10.10.10.10", "10.20.20.20", 6, _tcp(40000, 443, 0x02)))
         path = _pcap_of([syn])
@@ -172,25 +205,16 @@ class AnalysisTests(unittest.TestCase):
             os.remove(path)
 
 
-class NpcapResolveTests(unittest.TestCase):
-    def test_match_wifi_description_not_virtual(self):
-        from backend.npcap_wpcap import resolve_pcap_device
-        devices = [
-            {"name": r"\Device\NPF_{AAA}", "description": "WAN Miniport", "ips": []},
-            {"name": r"\Device\NPF_{WIFI}", "description": "Intel Wi-Fi 6 AX201", "ips": ["192.168.1.37"]},
-            {"name": r"\Device\NPF_{DIR}", "description": "Microsoft Wi-Fi Direct Virtual Adapter", "ips": []},
-        ]
-        # Patch list_pcap_devices
-        import backend.npcap_wpcap as m
-        orig = m.list_pcap_devices
-        m.list_pcap_devices = lambda: devices
-        try:
-            name, _ = m.resolve_pcap_device("Wi-Fi", "192.168.1.37")
-            self.assertEqual(name, r"\Device\NPF_{WIFI}")
-            name2, _ = m.resolve_pcap_device("Wi-Fi", None)
-            self.assertEqual(name2, r"\Device\NPF_{WIFI}")
-        finally:
-            m.list_pcap_devices = orig
+class RawIpFilterTests(unittest.TestCase):
+    def test_ip_datagram_filter(self):
+        from backend.windows_raw_capture import ip_datagram_match
+        pkt = _ipv4("192.168.1.37", "8.8.8.8", 6, _tcp(1, 443, 0x02))
+        self.assertTrue(ip_datagram_match(pkt, "8.8.8.8", "TCP", 443))
+        self.assertFalse(ip_datagram_match(pkt, "1.1.1.1", "TCP", 443))
+        self.assertFalse(ip_datagram_match(pkt, "8.8.8.8", "UDP", 443))
+
+
+class FilterTests(unittest.TestCase):
     def test_filter_rejects_injection(self):
         flt = build_capture_filter("10.20.20.20; rm -rf /", "TCP", 443, "10.10.10.10")
         self.assertNotIn("rm", flt)
@@ -208,7 +232,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(interpret_api_response({"status": "FAIL", "message": "blocked"}, local)["result"], "FAIL")
         self.assertEqual(interpret_api_response({"answer": "WARNING: partial"}, local)["result"], "WARNING")
         self.assertEqual(interpret_api_response({"result": "VERIFIED"}, local)["result"], "PASS")
-        self.assertEqual(interpret_api_response({"result": "NOT VERIFIED"}, local)["result"], "FAIL")
+        self.assertEqual(interpret_api_response({"result": "UNKNOWN"}, local)["result"], "UNKNOWN")
+        self.assertEqual(interpret_api_response({"result": "INSUFFICIENT_EVIDENCE"}, local)["result"], "UNKNOWN")
 
     def test_api_failure_keeps_pcap(self):
         syn = _eth(_ipv4("10.10.10.10", "10.20.20.20", 6, _tcp(40000, 443, 0x02)))

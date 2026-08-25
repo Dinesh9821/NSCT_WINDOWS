@@ -124,7 +124,7 @@ def _decode_frame(data, linktype):
             ip_data = data[4:]
         else:
             return _parse_ipv6(data[4:]) if len(data) > 4 else None
-    elif linktype in (LINKTYPE_RAW, 12, 14):
+    elif linktype in (LINKTYPE_RAW, 12, 14, 228):
         version = data[0] >> 4
         if version == 4:
             ip_data = data
