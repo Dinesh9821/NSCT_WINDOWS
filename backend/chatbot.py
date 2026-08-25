@@ -19,7 +19,10 @@ def send_to_llm(user_query: str, get_response_only: bool = False) -> str:
             LLM_API_URL, json=payload, auth=(USERNAME, PASSWORD), timeout=60
         )
         response.raise_for_status()
-        llm_answer = response.json().get("answer", "No response from LLM.")
+        try:
+            llm_answer = response.json().get("answer", "No response from LLM.")
+        except ValueError:
+            llm_answer = (response.text or "").strip() or "No response from LLM."
     except requests.RequestException as e:
         log.warning("LLM call failed: %s", e)
         llm_answer = f"LLM Error: {e}"

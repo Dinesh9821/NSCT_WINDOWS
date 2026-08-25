@@ -22,14 +22,14 @@ Self-contained page: it only reuses run_command / IS_WINDOWS / IS_MAC from the
 backend and does not modify any backend logic.
 """
 
-import re
-import time
-import socket
+import os
+import sys
+import subprocess
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit, QPushButton,
     QFrame, QComboBox, QScrollArea, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QSizePolicy
+    QAbstractItemView,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
@@ -38,204 +38,17 @@ from core.theme import theme, apply_soft_shadow
 from core import iconkit
 from core.workers import WorkerManager
 from widgets.console import ConsoleWidget
-from backend.diagnostics import run_command, IS_WINDOWS, IS_MAC
+from backend.diagnostics import run_command, IS_WINDOWS, IS_MAC, get_local_ip
+from backend.server_checks import (
+    verdict_for, local_firewall_status, local_listening_ports,
+)
+from core.constants import capture_dir
 
 
-# =========================================================================== #
-#  Checks (pure logic - safe to unit test)
-# =========================================================================== #
-MAX_PORTS = 64
-
-
-def parse_ports(text):
-    """
-    '80, 443, 8080-8082' -> [80, 443, 8080, 8081, 8082]
-    Ignores junk, de-duplicates, preserves order, caps at MAX_PORTS.
-    """
-    ports = []
-    for chunk in re.split(r"[,\s]+", (text or "").strip()):
-        if not chunk:
-            continue
-        m = re.match(r"^(\d{1,5})-(\d{1,5})$", chunk)
-        if m:
-            lo, hi = int(m.group(1)), int(m.group(2))
-            if lo > hi:
-                lo, hi = hi, lo
-            for p in range(lo, min(hi, 65535) + 1):
-                if 0 < p < 65536 and p not in ports:
-                    ports.append(p)
-                if len(ports) >= MAX_PORTS:
-                    return ports
-            continue
-        if chunk.isdigit():
-            p = int(chunk)
-            if 0 < p < 65536 and p not in ports:
-                ports.append(p)
-            if len(ports) >= MAX_PORTS:
-                return ports
-    return ports
-
-
-def resolve_host(host):
-    """DNS resolution -> {'ok', 'ip', 'error'}."""
-    try:
-        ip = socket.gethostbyname(host)
-        return {"ok": True, "ip": ip, "error": None}
-    except Exception as e:
-        return {"ok": False, "ip": None, "error": str(e)}
-
-
-def tcp_port_check(host, port, timeout=3.0):
-    """
-    Returns {'port', 'state', 'ms', 'detail'} where state is one of
-    open / closed / filtered / error.
-    """
-    t0 = time.perf_counter()
-    try:
-        sock = socket.create_connection((host, port), timeout=timeout)
-        sock.close()
-        return {"port": port, "state": "open", "ms": round((time.perf_counter() - t0) * 1000),
-                "detail": "TCP handshake succeeded"}
-    except socket.timeout:
-        return {"port": port, "state": "filtered", "ms": round(timeout * 1000),
-                "detail": "No response before timeout (silently dropped)"}
-    except ConnectionRefusedError:
-        return {"port": port, "state": "closed", "ms": round((time.perf_counter() - t0) * 1000),
-                "detail": "Connection refused (host up, nothing listening)"}
-    except socket.gaierror as e:
-        return {"port": port, "state": "error", "ms": None,
-                "detail": "DNS resolution failed: {}".format(e)}
-    except OSError as e:
-        # EHOSTUNREACH / ENETUNREACH / EACCES ...
-        return {"port": port, "state": "error", "ms": None, "detail": str(e)}
-
-
-def verdict_for(state):
-    """Human verdict + palette key for a port state."""
-    return {
-        "open": ("OPEN - reachable, not blocked", "SUCCESS"),
-        "closed": ("CLOSED - host reachable, no service listening (not a firewall block)", "WARNING"),
-        "filtered": ("FILTERED - no reply; a firewall is most likely blocking this port", "ERROR"),
-        "error": ("ERROR - could not test", "TEXT_SECONDARY"),
-    }.get(state, ("UNKNOWN", "TEXT_SECONDARY"))
-
-
-def cli_port_check(host, port, proto="TCP", timeout=3):
-    """The 'via cmd' proof: netcat on macOS/Linux, Test-NetConnection on Windows."""
-    if IS_WINDOWS:
-        cmd = ('powershell -NoProfile -Command "Test-NetConnection -ComputerName {h} '
-               '-Port {p} -InformationLevel Detailed"').format(h=host, p=port)
-        return cmd, run_command(cmd, timeout=timeout + 12)
-    flag = "-zvu" if proto.upper() == "UDP" else "-zv"
-    cmd = "nc {f} -w {t} {h} {p}".format(f=flag, t=timeout, h=host, p=port)
-    return cmd, run_command(cmd + " 2>&1", timeout=timeout + 8)
-
-
-def ping_check(host, count=4):
-    """ICMP reachability -> {'reachable', 'loss_pct', 'avg_ms', 'cmd', 'raw'}."""
-    cmd = ("ping -n {c} {h}" if IS_WINDOWS else "ping -c {c} {h}").format(c=count, h=host)
-    raw = run_command(cmd, timeout=count * 3 + 8)
-    low = raw.lower()
-    if IS_WINDOWS:
-        recv = re.search(r"received\s*=\s*(\d+)", low)
-        loss = re.search(r"\((\d+)%\s*loss\)", raw)
-        avg = re.search(r"average\s*=\s*(\d+)\s*ms", low)
-        reachable = bool(recv and int(recv.group(1)) > 0)
-        return {"reachable": reachable,
-                "loss_pct": int(loss.group(1)) if loss else None,
-                "avg_ms": int(avg.group(1)) if avg else None, "cmd": cmd, "raw": raw}
-    recv = re.search(r"(\d+)\s+packets received", low)
-    loss = re.search(r"([\d.]+)%\s*packet loss", raw)
-    avg = re.search(r"=\s*[\d.]+/([\d.]+)/", raw)
-    reachable = bool(recv and int(recv.group(1)) > 0)
-    return {"reachable": reachable,
-            "loss_pct": int(round(float(loss.group(1)))) if loss else None,
-            "avg_ms": round(float(avg.group(1))) if avg else None, "cmd": cmd, "raw": raw}
-
-
-def local_firewall_status():
-    """Local firewall state -> {'enabled', 'summary', 'cmd', 'raw'}."""
-    if IS_WINDOWS:
-        cmd = "netsh advfirewall show allprofiles state"
-        raw = run_command(cmd, timeout=20)
-        enabled = "ON" in raw.upper()
-        return {"enabled": enabled,
-                "summary": "Windows Firewall is ON for one or more profiles." if enabled
-                           else "Windows Firewall appears OFF.",
-                "cmd": cmd, "raw": raw}
-    if IS_MAC:
-        fw = "/usr/libexec/ApplicationFirewall/socketfilterfw"
-        cmd = "{fw} --getglobalstate; {fw} --getblockall; {fw} --getstealthmode".format(fw=fw)
-        raw = run_command(cmd + " 2>&1", timeout=20)
-        enabled = ("state = 1" in raw.lower()) or ("enabled" in raw.lower()
-                                                   and "disabled" not in raw.lower())
-        summary = ("macOS Application Firewall is ENABLED." if enabled
-                   else "macOS Application Firewall is disabled "
-                        "(outbound connections are not filtered by it).")
-        return {"enabled": enabled, "summary": summary, "cmd": cmd, "raw": raw}
-    return {"enabled": None, "summary": "Firewall state unavailable on this platform.",
-            "cmd": "", "raw": ""}
-
-
-def local_listening_ports():
-    """What is listening on THIS machine (useful when testing your own server)."""
-    if IS_WINDOWS:
-        cmd = "netstat -ano | findstr LISTENING"
-        return cmd, run_command(cmd, timeout=25)
-    cmd = "lsof -nP -iTCP -sTCP:LISTEN"
-    raw = run_command(cmd + " 2>/dev/null", timeout=25)
-    if not raw or raw == "No output available.":
-        cmd = "netstat -an -p tcp | grep LISTEN"
-        raw = run_command(cmd, timeout=25)
-    return cmd, raw
-
-
-def is_local_target(host, resolved_ip):
-    """True when the target is this machine (loopback / a local address)."""
-    candidates = {host, resolved_ip or ""}
-    if candidates & {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
-        return True
-    try:
-        local = socket.gethostbyname(socket.gethostname())
-        return resolved_ip == local
-    except Exception:
-        return False
-
-
-def run_server_test(host, ports_text, proto="TCP", timeout=3.0):
-    """Worker payload: DNS -> ping -> per-port TCP -> CLI proof for the first port."""
-    host = (host or "").strip()
-    result = {"host": host, "dns": None, "ping": None, "ports": [],
-              "raw": [], "local": False, "proto": proto}
-    if not host:
-        result["error"] = "Enter a hostname or IP."
-        return result
-
-    dns = resolve_host(host)
-    result["dns"] = dns
-
-    ping = ping_check(host)
-    result["ping"] = ping
-    result["raw"].append(("Reachability  -  {}".format(ping["cmd"]), ping["raw"]))
-
-    ports = parse_ports(ports_text)
-    if not ports:
-        result["error"] = "Enter at least one valid port (e.g. 443 or 80,443,8080-8082)."
-        return result
-
-    for port in ports:
-        result["ports"].append(tcp_port_check(host, port, timeout=timeout))
-
-    # CLI proof for the first port so the user sees the actual command output
-    cmd, raw = cli_port_check(host, ports[0], proto=proto, timeout=int(timeout))
-    result["raw"].append(("Port check  -  {}".format(cmd), raw))
-
-    result["local"] = is_local_target(host, dns.get("ip"))
-    if result["local"]:
-        lcmd, lraw = local_listening_ports()
-        result["raw"].append(("Local listening ports  -  {}".format(lcmd), lraw))
-    return result
-
+def _run_verified(host, ports_text, proto, timeout):
+    """Background entry: capture + diagnose + analyze + Verification API."""
+    from backend.network_verify import run_verified_server_test
+    return run_verified_server_test(host, ports_text, proto=proto, timeout=timeout)
 
 # =========================================================================== #
 #  Page
@@ -259,7 +72,8 @@ class ServerTestPage(QWidget):
         title.setProperty("role", "title")
         title.setStyleSheet("font-size: 24px; font-weight: 800;")
         sub = QLabel("Check whether a server is reachable, whether a port is open, "
-                     "and whether a firewall is blocking it.")
+                     "and whether a firewall is blocking it. Each run captures live "
+                     "packets as Wireshark-compatible evidence and sends them for verification.")
         sub.setProperty("role", "subtitle")
         sub.setWordWrap(True)
         self.body.addWidget(title)
@@ -315,7 +129,7 @@ class ServerTestPage(QWidget):
         lbl_proto = QLabel("Protocol")
         lbl_proto.setProperty("role", "secondary")
         self.cmb_proto = QComboBox()
-        self.cmb_proto.addItems(["TCP", "UDP"])
+        self.cmb_proto.addItems(["TCP", "UDP", "ICMP"])
         self.cmb_proto.setFixedHeight(42)
         self.cmb_proto.setStyleSheet(self._combo_style())
 
@@ -339,6 +153,10 @@ class ServerTestPage(QWidget):
         grid.setColumnStretch(1, 2)
         lay.addLayout(grid)
 
+        self.lbl_source = QLabel("Source: {}".format(get_local_ip()))
+        self.lbl_source.setProperty("role", "secondary")
+        lay.addWidget(self.lbl_source)
+
         row = QHBoxLayout()
         row.setSpacing(10)
         self.btn_run = QPushButton("  Run Server Test")
@@ -356,6 +174,13 @@ class ServerTestPage(QWidget):
         iconkit.button(self.btn_fw, "fa5s.shield-alt", role="ACCENT", size=14)
         self.btn_fw.clicked.connect(self._run_firewall)
         row.addWidget(self.btn_fw)
+        self.btn_caps = QPushButton("  Open Captures")
+        self.btn_caps.setProperty("cls", "ghost")
+        self.btn_caps.setFixedHeight(44)
+        self.btn_caps.setCursor(Qt.PointingHandCursor)
+        iconkit.button(self.btn_caps, "fa5s.folder-open", role="ACCENT", size=14)
+        self.btn_caps.clicked.connect(self._open_captures)
+        row.addWidget(self.btn_caps)
         row.addStretch()
         lay.addLayout(row)
 
@@ -448,7 +273,7 @@ class ServerTestPage(QWidget):
         self.lbl_detail.setText("")
         self.console.set_text("Running checks against {}\u2026".format(host), theme.c("ACCENT"))
         self.workers.run(
-            run_server_test, host, self.txt_ports.text(),
+            _run_verified, host, self.txt_ports.text(),
             self.cmb_proto.currentText(), self._timeout_value(),
             on_finished=self._done,
             on_error=lambda e: self._failed(str(e)),
@@ -494,10 +319,21 @@ class ServerTestPage(QWidget):
             headline, key = "Hostname could not be resolved", "ERROR"
             detail = "DNS lookup failed: {}. Check the name or your DNS settings.".format(
                 dns.get("error"))
+        elif (res.get("protocol") or res.get("proto") or "").upper() == "ICMP":
+            if ping.get("reachable"):
+                headline, key = "Host replied to ICMP echo", "SUCCESS"
+                detail = "Echo requests were sent and at least one reply was received."
+            else:
+                headline, key = "No ICMP echo reply", "ERROR"
+                detail = ("The ping completed without a reply. Many servers block ICMP, "
+                          "so this is not conclusive by itself — see packet evidence below.")
         elif open_ports:
             headline, key = "Server is reachable and port {} is OPEN".format(
                 ", ".join(str(p) for p in open_ports)), "SUCCESS"
-            detail = "A TCP handshake completed, so nothing on the path is blocking it."
+            if (res.get("protocol") or res.get("proto") or "").upper() == "UDP":
+                detail = "A UDP response was received, so the path is not silently dropping this port."
+            else:
+                detail = "A TCP handshake completed, so nothing on the path is blocking it."
         elif filtered:
             headline, key = "Port {} appears BLOCKED by a firewall".format(
                 ", ".join(str(p) for p in filtered)), "ERROR"
@@ -524,13 +360,58 @@ class ServerTestPage(QWidget):
         if res.get("local"):
             bits.append("target is this machine")
 
+        ver = res.get("verification") or {}
+        if ver.get("result") == "PASS":
+            key = "SUCCESS"
+        elif ver.get("result") == "FAIL":
+            key = "ERROR"
+        elif ver.get("result") == "WARNING":
+            key = "WARNING"
+        cap = res.get("capture") or {}
+        analysis = res.get("packet_analysis") or {}
+        if res.get("test_id"):
+            bits.append("id {}".format(res["test_id"]))
+        if cap:
+            bits.append("pcap {} pkt".format(cap.get("packet_count", 0)))
+        if ver.get("result"):
+            bits.append("verified {}".format(ver["result"]))
+
         self.lbl_verdict.setText(headline)
         self.lbl_verdict.setStyleSheet(
             "font-size: 15px; font-weight: 700; color: {};".format(theme.c(key)))
-        self.lbl_detail.setText(detail + "\n" + "  \u00b7  ".join(bits))
+        extra = []
+        if ver:
+            extra.append("API Verification: {} — {}".format(
+                ver.get("result") or "—", ver.get("reason") or ""))
+            if ver.get("api_error"):
+                extra.append(ver["api_error"])
+        tcp = analysis.get("tcp") or {}
+        if (res.get("protocol") or res.get("proto") or "").upper() == "TCP" and tcp:
+            extra.append("TCP  SYN={}  SYN/ACK={}  ACK={}  RST={}  Retransmissions={}".format(
+                tcp.get("syn"), tcp.get("syn_ack"), tcp.get("ack"),
+                tcp.get("rst"), tcp.get("retransmissions")))
+        icmp = analysis.get("icmp") or {}
+        if (res.get("protocol") or res.get("proto") or "").upper() == "ICMP" and icmp:
+            extra.append("ICMP  Request={}  Reply={}  Loss={}%".format(
+                icmp.get("echo_request"), icmp.get("echo_reply"), icmp.get("packet_loss_pct")))
+        if cap.get("filename"):
+            extra.append("Capture: {} ({})".format(
+                cap.get("filename"),
+                "Wireshark compatible" if cap.get("wireshark_compatible") else "invalid"))
+        if cap.get("error"):
+            extra.append(cap["error"])
+        self.lbl_detail.setText(
+            detail + "\n" + "  \u00b7  ".join(bits)
+            + (("\n" + "\n".join(extra)) if extra else ""))
 
         # ---- raw output ----
         blocks = []
+        try:
+            from backend.network_verify import format_evidence_report
+            blocks.append(format_evidence_report(res))
+            blocks.append("")
+        except Exception:
+            pass
         for caption, text in res.get("raw", []):
             blocks.append("=" * 66)
             blocks.append(caption)
@@ -576,3 +457,15 @@ class ServerTestPage(QWidget):
             out.append(text or "(no output)")
             out.append("")
         self.console.set_text("\n".join(out) or "(no output)", theme.c("TEXT_PRIMARY"))
+
+    def _open_captures(self):
+        path = capture_dir()
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(path)  # noqa
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception:
+            self.lbl_detail.setText("Capture folder: {}".format(path))
