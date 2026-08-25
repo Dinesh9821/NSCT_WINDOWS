@@ -1,0 +1,7 @@
+# Windows build — Python 3.10+ recommended
+PySide6>=6.6            # includes QtWebEngine (Addons) for the pyvis topology view
+qtawesome>=1.2
+psutil>=5.9
+requests>=2.31
+pyvis>=0.3.2           # pulls in networkx, jinja2, jsonpickle
+fpdf2>=2.7             # PDF export of the diagnostic report
