@@ -172,11 +172,31 @@ class AnalysisTests(unittest.TestCase):
             os.remove(path)
 
 
-class FilterTests(unittest.TestCase):
+class NpcapResolveTests(unittest.TestCase):
+    def test_match_wifi_description_not_virtual(self):
+        from backend.npcap_wpcap import resolve_pcap_device
+        devices = [
+            {"name": r"\Device\NPF_{AAA}", "description": "WAN Miniport", "ips": []},
+            {"name": r"\Device\NPF_{WIFI}", "description": "Intel Wi-Fi 6 AX201", "ips": ["192.168.1.37"]},
+            {"name": r"\Device\NPF_{DIR}", "description": "Microsoft Wi-Fi Direct Virtual Adapter", "ips": []},
+        ]
+        # Patch list_pcap_devices
+        import backend.npcap_wpcap as m
+        orig = m.list_pcap_devices
+        m.list_pcap_devices = lambda: devices
+        try:
+            name, _ = m.resolve_pcap_device("Wi-Fi", "192.168.1.37")
+            self.assertEqual(name, r"\Device\NPF_{WIFI}")
+            name2, _ = m.resolve_pcap_device("Wi-Fi", None)
+            self.assertEqual(name2, r"\Device\NPF_{WIFI}")
+        finally:
+            m.list_pcap_devices = orig
     def test_filter_rejects_injection(self):
         flt = build_capture_filter("10.20.20.20; rm -rf /", "TCP", 443, "10.10.10.10")
         self.assertNotIn("rm", flt)
-        self.assertIn("tcp port 443", build_capture_filter("10.20.20.20", "TCP", 443, "10.10.10.10"))
+        self.assertEqual(
+            build_capture_filter("10.20.20.20", "TCP", 443, "10.10.10.10"),
+            "host 10.20.20.20 and tcp port 443")
         self.assertIn("icmp", build_capture_filter("1.1.1.1", "ICMP", None, "10.10.10.10"))
         self.assertIn("udp port 53", build_capture_filter("8.8.8.8", "UDP", 53, "10.0.0.1"))
 

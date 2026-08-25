@@ -70,6 +70,16 @@ def dumpcap_path():
     return None
 
 
+def is_windows_admin():
+    if not IS_WINDOWS:
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
 def tcpdump_path():
     return shutil.which("tcpdump")
 
@@ -113,9 +123,9 @@ def build_capture_filter(dest_ip, protocol=None, port=None, source_ip=None):
     of the filter expression.
     """
     parts = []
-    if source_ip and _valid_ip(source_ip) and dest_ip and _valid_ip(dest_ip):
-        parts.append("(host %s and host %s)" % (source_ip, dest_ip))
-    elif dest_ip and _valid_ip(dest_ip):
+    if dest_ip and _valid_ip(dest_ip):
+        # Dest-only is more reliable than src AND dest: VPN/NAT and extra A
+        # records would otherwise drop the handshake from the capture.
         parts.append("host %s" % dest_ip)
     proto = (protocol or "").upper()
     if proto == "ICMP":
@@ -209,14 +219,17 @@ class PacketCapture:
         self._linktype = 1
 
     def start(self):
-        log.info("Capture started path=%s filter=%s iface=%s", self.path, self.filter, self.interface)
+        log.info("Capture started path=%s filter=%s iface=%s dumpcap=%s npcap=%s admin=%s",
+                 self.path, self.filter, self.interface, dumpcap_path() or "(not found)",
+                 npcap_installed(), is_windows_admin())
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         for name, fn in (
             ("dumpcap", self._start_dumpcap),
+            ("npcap", self._start_npcap),
+            ("scapy", self._start_scapy),
             ("pktmon", self._start_pktmon),
             ("tcpdump", self._start_tcpdump),
             ("afpacket", self._start_afpacket),
-            ("scapy", self._start_scapy),
         ):
             try:
                 if fn():
@@ -243,7 +256,7 @@ class PacketCapture:
                 self._stop_proc()
             elif self.backend == "pktmon":
                 self._stop_pktmon()
-            elif self.backend in ("afpacket", "scapy"):
+            elif self.backend in ("afpacket", "scapy", "npcap"):
                 self._stop.set()
                 if self._thread:
                     self._thread.join(timeout=5)
@@ -294,31 +307,113 @@ class PacketCapture:
     def _unavailable_message(self):
         if IS_WINDOWS:
             np = "installed" if npcap_installed() else "not installed"
+            dc = dumpcap_path()
+            admin = is_windows_admin()
+            extra = []
+            if not dc:
+                extra.append("Wireshark dumpcap.exe was not found (Npcap alone is not dumpcap).")
+            if npcap_installed() and not admin:
+                extra.append(
+                    "If capture still fails, Npcap was likely installed with "
+                    "'Restrict Npcap driver's access to Administrators only' — "
+                    "reinstall Npcap with that box unchecked, or Run as Administrator."
+                )
             return (
-                "Packet capture unavailable. On Windows this requires Npcap "
-                "(bundled with Wireshark) or an elevated pktmon session. "
-                "Npcap is %s. Run the app as Administrator if capture is "
-                "installed but still fails. Network diagnostics will continue."
-            ) % np
+                "Packet capture unavailable. Npcap is %s. Administrator=%s. %s "
+                "Network diagnostics will continue."
+            ) % (np, admin, " ".join(extra))
         return (
             "Packet capture unavailable (permission or backend missing). "
             "Install tcpdump or run with CAP_NET_RAW. Diagnostics will continue."
         )
 
+    def _pcap_device(self):
+        """Npcap/dumpcap device name (\\Device\\NPF_{GUID}), not 'Wi-Fi'."""
+        if not IS_WINDOWS:
+            return self.interface
+        try:
+            from backend.npcap_wpcap import resolve_pcap_device
+            name, devices = resolve_pcap_device(self.interface, self.source_ip)
+            log.info("Npcap devices=%s selected=%s (friendly=%s)",
+                     [(d.get("description"), d.get("ips")) for d in devices],
+                     name, self.interface)
+            return name or self.interface
+        except Exception:
+            log.warning("Npcap device listing failed", exc_info=True)
+            return self.interface
+
     # ----- dumpcap --------------------------------------------------------
     def _start_dumpcap(self):
         exe = dumpcap_path()
         if not exe:
+            log.info("dumpcap not found (install Wireshark, or rely on Npcap wpcap)")
             return False
         args = [exe, "-q", "-w", self.path]
-        iface = self.interface
-        if iface and _IFACE.match(iface):
-            args.extend(["-i", iface])
+        device = self._pcap_device()
+        if device:
+            args.extend(["-i", device])
+        elif not IS_WINDOWS:
+            args.extend(["-i", "any"])
         else:
-            args.extend(["-i", "any"] if not IS_WINDOWS else ["-i", "1"])
+            args.extend(["-i", "1"])
         if self.filter:
             args.extend(["-f", self.filter])
         return self._spawn(args)
+
+    # ----- Npcap wpcap.dll ------------------------------------------------
+    def _start_npcap(self):
+        if not IS_WINDOWS:
+            return False
+        try:
+            from backend.npcap_wpcap import NpcapLive, load_wpcap
+        except Exception:
+            log.warning("npcap module import failed", exc_info=True)
+            return False
+        if load_wpcap() is None:
+            log.info("Npcap wpcap.dll could not be loaded")
+            return False
+        device = self._pcap_device()
+        if not device:
+            log.info("No Npcap capture device matched interface %s", self.interface)
+            return False
+        live = NpcapLive()
+        try:
+            live.open(device, bpf=self.filter)
+        except Exception as e:
+            log.info("Npcap open failed on %s: %s", device, e)
+            try:
+                live.close()
+            except Exception:
+                pass
+            return False
+        self._stop.clear()
+        self._frames = []
+        self._linktype = live.linktype or 1
+
+        def _loop():
+            try:
+                deadline = time.time() + self.timeout
+                while not self._stop.is_set() and time.time() < deadline:
+                    try:
+                        pkt = live.next_packet()
+                    except Exception as exc:
+                        log.warning("Npcap read error: %s", exc)
+                        break
+                    if not pkt:
+                        continue
+                    ts, data = pkt
+                    if live.filtered or _userspace_match(
+                            data, self.dest_ip, self.protocol, self.port, self.source_ip):
+                        self._frames.append((ts, data))
+            finally:
+                try:
+                    live.close()
+                except Exception:
+                    pass
+
+        self._thread = threading.Thread(target=_loop, name="npcap-capture", daemon=True)
+        self._thread.start()
+        return True
 
     # ----- tcpdump --------------------------------------------------------
     def _start_tcpdump(self):
@@ -413,6 +508,9 @@ class PacketCapture:
     def _start_pktmon(self):
         exe = pktmon_path()
         if not exe:
+            return False
+        if not is_windows_admin():
+            log.info("Skipping pktmon (Access denied unless the app is Run as Administrator)")
             return False
         self._etl = self.path + ".etl"
         # Reset filters (best-effort); ignore failures.
@@ -573,5 +671,6 @@ def capture_status():
         "interface": detect_interface(),
         "capture_dir": capture_dir(),
         "windows": IS_WINDOWS,
-        "admin_hint": IS_WINDOWS,
+        "admin": is_windows_admin(),
+        "dumpcap_path": dumpcap_path(),
     }
