@@ -7,6 +7,7 @@ binaries = []
 hiddenimports = [
     'PySide6.QtWebEngineWidgets', 'PySide6.QtWebEngineCore', 'PySide6.QtWebChannel',
     'backend.windows_pktmon', 'backend.windows_raw_capture', 'backend.windows_elevate',
+    'backend.macos_bpf_capture', 'backend.macos_elevate', 'backend.elevate',
     'backend.packet_capture', 'backend.pcap_io', 'backend.packet_analysis',
     'backend.network_verify', 'backend.verification', 'backend.server_checks',
 ]

@@ -377,6 +377,53 @@ class ElevateTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("Windows", err)
 
+    def test_macos_elevate_rejected_off_darwin(self):
+        from backend.macos_elevate import relaunch_as_admin, is_macos
+        if is_macos():
+            self.skipTest("macOS host")
+        ok, err = relaunch_as_admin()
+        self.assertFalse(ok)
+        self.assertIn("Darwin", err)
+
+
+class MacosBpfTests(unittest.TestCase):
+    def test_parse_bpf_buffer_and_ethernet_match(self):
+        from backend.macos_bpf_capture import (
+            parse_bpf_buffer, bpf_wordalign, dlt_to_linktype, frame_matches,
+            ip_from_frame, DLT_EN10MB, DLT_NULL,
+        )
+        payload = _eth(_ipv4("192.168.1.10", "8.8.8.8", 6, _tcp(1, 443, 0x02)))
+        caplen = len(payload)
+        hdrlen = 26
+        header = (b"\x00" * 16) + struct.pack("<IIH", caplen, caplen, hdrlen)
+        rec = header + payload
+        rec += b"\x00" * (bpf_wordalign(len(rec)) - len(rec))
+        frames = parse_bpf_buffer(rec)
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0], payload)
+        self.assertEqual(dlt_to_linktype(DLT_NULL), 0)
+        self.assertEqual(dlt_to_linktype(DLT_EN10MB), 1)
+        self.assertTrue(frame_matches(payload, DLT_EN10MB, "8.8.8.8", "TCP", 443))
+        self.assertFalse(frame_matches(payload, DLT_EN10MB, "1.1.1.1", "TCP", 443))
+        loop = b"\x02\x00\x00\x00" + _ipv4("127.0.0.1", "127.0.0.1", 1, _icmp(8))
+        self.assertIsNotNone(ip_from_frame(loop, DLT_NULL))
+        self.assertTrue(frame_matches(loop, DLT_NULL, "127.0.0.1", "ICMP", None))
+
+    def test_null_linktype_tcp_handshake(self):
+        from backend.pcap_io import write_pcapng, LINKTYPE_NULL
+        syn = b"\x02\x00\x00\x00" + _ipv4("10.10.10.10", "10.20.20.20", 6, _tcp(40000, 443, 0x02, seq=1))
+        synack = b"\x02\x00\x00\x00" + _ipv4("10.20.20.20", "10.10.10.10", 6, _tcp(443, 40000, 0x12, seq=9, ack=2))
+        ack = b"\x02\x00\x00\x00" + _ipv4("10.10.10.10", "10.20.20.20", 6, _tcp(40000, 443, 0x10, seq=2, ack=10))
+        fd, path = tempfile.mkstemp(suffix=".pcapng")
+        os.close(fd)
+        write_pcapng(path, [(time.time(), syn), (time.time(), synack), (time.time(), ack)],
+                     linktype=LINKTYPE_NULL)
+        try:
+            a = analyze_pcap(path, "TCP", "10.10.10.10", "10.20.20.20", 443)
+            self.assertTrue(a["tcp"]["handshake_complete"])
+        finally:
+            os.remove(path)
+
 
 class ReportTests(unittest.TestCase):
     def test_test_id_format(self):

@@ -62,7 +62,7 @@ class SettingsPage(QWidget):
             ("PCAP retention", "{} files".format(PCAP_RETENTION)),
             ("Administrator", "yes" if st.get("admin") else "no"),
             ("Preferred capture", st.get("preferred_backend") or "—"),
-            ("Runtime deps", "none (Windows uses inbox pktmon + SIO_RCVALL)"),
+            ("Runtime deps", st.get("runtime_deps") or "none"),
         ])
         self._build_card("System", [
             ("Hostname", socket.gethostname()),

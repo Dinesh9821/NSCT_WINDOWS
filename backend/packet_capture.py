@@ -7,15 +7,16 @@ Windows (no Wireshark / Npcap / dumpcap / tshark required at runtime):
   2. SOCK_RAW + SIO_RCVALL — in-process IPv4 datagram capture (Administrator).
      No Ethernet header; Wireshark LINKTYPE_RAW.
 
-Unix (this repo's CI / macOS):
+macOS (no Wireshark required; uses OS facilities only):
+  1. /dev/bpf* — in-process Berkeley Packet Filter (root). Ethernet or DLT_NULL.
+  2. /usr/sbin/tcpdump — Apple inbox tcpdump (root), same kernel BPF.
+
+Linux:
   AF_PACKET or tcpdump when the OS provides them.
 
 PCAP/PCAPNG is always written by backend.pcap_io (stdlib) except when pktmon
 writes a native pcapng via etl2pcap. Packets are never synthesized from
 ping/connect output.
-
-Limitation (Windows): Ethernet/L2 sniffing of a NIC requires an NDIS filter
-driver. Microsoft does not expose that to user-mode without such a driver.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ import psutil
 
 from core.constants import PACKET_CAPTURE_TIMEOUT, CAPTURE_INTERFACE, capture_dir
 from backend.pcap_io import write_pcapng, file_magic_ok, packet_count, empty_pcapng, LINKTYPE_RAW
-from backend.diagnostics import get_local_ip, _no_window_kwargs, IS_WINDOWS
+from backend.diagnostics import get_local_ip, _no_window_kwargs, IS_WINDOWS, IS_MAC
 
 log = logging.getLogger("NetworkAI.Capture")
 
@@ -85,7 +86,12 @@ def is_windows_admin():
 
 
 def tcpdump_path():
-    return shutil.which("tcpdump")
+    found = shutil.which("tcpdump")
+    if IS_MAC:
+        for candidate in (found, "/usr/sbin/tcpdump", "/usr/bin/tcpdump"):
+            if candidate and os.path.isfile(candidate):
+                return candidate
+    return found
 
 
 def pktmon_path():
@@ -98,14 +104,31 @@ def pktmon_path():
     )
 
 
-def detect_interface(source_ip=None):
+def is_elevated():
+    if IS_WINDOWS:
+        return is_windows_admin()
+    try:
+        return os.geteuid() == 0
+    except Exception:
+        return False
+
+
+def detect_interface(source_ip=None, dest_ip=None):
     """Return an OS interface name matching the source IP, if possible."""
     configured = (CAPTURE_INTERFACE or "").strip()
     if configured:
         return configured
+    dest_ip = (dest_ip or "").strip()
+    if dest_ip in ("127.0.0.1", "::1"):
+        if IS_MAC:
+            return "lo0"
+        if not IS_WINDOWS:
+            return "lo"
     source_ip = source_ip or get_local_ip()
     try:
         for name, addrs in psutil.net_if_addrs().items():
+            if _skip_iface(name):
+                continue
             for a in addrs:
                 if a.address == source_ip:
                     return name
@@ -114,11 +137,20 @@ def detect_interface(source_ip=None):
     try:
         stats = psutil.net_if_stats()
         for name, st in stats.items():
-            if st.isup and name and not name.lower().startswith("lo"):
+            if st.isup and name and not _skip_iface(name):
                 return name
     except Exception:
         pass
     return None
+
+
+def _skip_iface(name):
+    n = (name or "").lower()
+    if n.startswith("lo"):
+        return True
+    if n.startswith(("awdl", "llw", "gif", "stf", "anpi")):
+        return True
+    return False
 
 
 def build_capture_filter(dest_ip, protocol=None, port=None, source_ip=None):
@@ -206,7 +238,7 @@ class PacketCapture:
         self.protocol = (protocol or "").upper()
         self.port = port
         self.source_ip = source_ip or get_local_ip()
-        self.interface = interface or detect_interface(self.source_ip)
+        self.interface = interface or detect_interface(self.source_ip, dest_ip=dest_ip)
         self.timeout = int(timeout or PACKET_CAPTURE_TIMEOUT)
         self.filter = build_capture_filter(
             dest_ip, protocol=self.protocol, port=port, source_ip=self.source_ip)
@@ -226,7 +258,7 @@ class PacketCapture:
 
     def start(self):
         log.info("Capture started path=%s filter=%s iface=%s src=%s admin=%s",
-                 self.path, self.filter, self.interface, self.source_ip, is_windows_admin())
+                 self.path, self.filter, self.interface, self.source_ip, is_elevated())
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         backends = []
         if IS_WINDOWS:
@@ -241,6 +273,11 @@ class PacketCapture:
                     ("npcap", self._start_npcap),
                     ("scapy", self._start_scapy),
                 ])
+        elif IS_MAC:
+            backends.extend([
+                ("macos_bpf", self._start_macos_bpf),
+                ("tcpdump", self._start_tcpdump),
+            ])
         else:
             backends.extend([
                 ("afpacket", self._start_afpacket),
@@ -272,14 +309,19 @@ class PacketCapture:
                 self._stop_proc()
             elif self.backend == "pktmon":
                 self._stop_pktmon()
-            elif self.backend == "windows_raw":
+            elif self.backend in ("windows_raw", "macos_bpf"):
                 engine = getattr(self, "_raw_engine", None)
                 if engine is not None:
                     self._frames = engine.stop()
+                    if getattr(engine, "linktype", None) is not None:
+                        self._linktype = engine.linktype
                     self._raw_engine = None
                     self._thread = None
                 try:
-                    write_pcapng(self.path, list(self._frames), linktype=self._linktype or LINKTYPE_RAW)
+                    lt = self._linktype
+                    if lt is None:
+                        lt = LINKTYPE_RAW if IS_WINDOWS else 1
+                    write_pcapng(self.path, list(self._frames), linktype=lt)
                 except Exception:
                     log.exception("failed to write pcapng")
             elif self.backend in ("afpacket", "scapy", "npcap"):
@@ -343,6 +385,15 @@ class PacketCapture:
                 "without an NDIS filter driver (a Windows architectural limit). "
                 "Network diagnostics will continue; the PCAP may be empty."
             ) % admin
+        if IS_MAC:
+            return (
+                "Packet capture unavailable. This build does not use Wireshark. "
+                "On macOS, live frames are observed with /dev/bpf (kernel BPF) or "
+                "inbox /usr/sbin/tcpdump — both need administrator (root). "
+                "This process is elevated: %s. Use Restart as Administrator on "
+                "Server Test if that is False. Diagnostics will continue; the "
+                "PCAP may be empty."
+            ) % is_elevated()
         return (
             "Packet capture unavailable (permission or backend missing). "
             "Install tcpdump or run with CAP_NET_RAW. Diagnostics will continue."
@@ -368,6 +419,28 @@ class PacketCapture:
         self._frames = cap.frames
         self._linktype = LINKTYPE_RAW
         # Reader thread lives inside WindowsRawCapture.
+        self._thread = cap._thread
+        return True
+
+    def _start_macos_bpf(self):
+        if not IS_MAC:
+            return False
+        from backend.macos_bpf_capture import MacosBpfCapture
+        cap = MacosBpfCapture(
+            self.interface, dest_ip=self.dest_ip, protocol=self.protocol,
+            port=self.port, timeout=self.timeout)
+        try:
+            cap.start()
+        except PermissionError as e:
+            log.info("macOS BPF capture not permitted: %s", e)
+            return False
+        except OSError as e:
+            log.info("macOS BPF capture failed: %s", e)
+            return False
+        self._raw_engine = cap
+        self._stop.clear()
+        self._frames = cap.frames
+        self._linktype = cap.linktype if cap.linktype is not None else 1
         self._thread = cap._thread
         return True
 
@@ -467,6 +540,8 @@ class PacketCapture:
         iface_args = []
         if self.interface and _IFACE.match(self.interface):
             iface_args = ["-i", self.interface]
+        elif IS_MAC:
+            iface_args = ["-i", "en0"]
         else:
             iface_args = ["-i", "any"]
         filt = [self.filter] if self.filter else []
@@ -584,7 +659,7 @@ class PacketCapture:
 
     # ----- AF_PACKET / raw (userspace filter) -----------------------------
     def _start_afpacket(self):
-        if IS_WINDOWS:
+        if IS_WINDOWS or IS_MAC or not hasattr(socket, "AF_PACKET"):
             return False
         try:
             sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
@@ -693,7 +768,23 @@ def _userspace_match(frame, dest_ip, protocol, port, source_ip):
 def capture_status():
     """Lightweight capability probe for Settings / error messages."""
     pktmon = bool(pktmon_path())
-    admin = is_windows_admin()
+    admin = is_elevated()
+    if IS_WINDOWS:
+        preferred = (
+            "pktmon" if (admin and pktmon)
+            else "windows_raw" if admin
+            else "none (run as Administrator)"
+        )
+        runtime = "none (Windows uses inbox pktmon + SIO_RCVALL)"
+    elif IS_MAC:
+        preferred = (
+            "macos_bpf" if admin
+            else "none (run as Administrator)"
+        )
+        runtime = "none (macOS uses /dev/bpf + inbox /usr/sbin/tcpdump)"
+    else:
+        preferred = "afpacket/tcpdump"
+        runtime = "none (AF_PACKET or tcpdump)"
     return {
         "npcap": npcap_installed(),
         "dumpcap": bool(dumpcap_path()),
@@ -702,13 +793,10 @@ def capture_status():
         "interface": detect_interface(),
         "capture_dir": capture_dir(),
         "windows": IS_WINDOWS,
+        "macos": IS_MAC,
         "admin": admin,
         "dumpcap_path": dumpcap_path(),
-        "preferred_backend": (
-            "pktmon" if (IS_WINDOWS and admin and pktmon)
-            else "windows_raw" if (IS_WINDOWS and admin)
-            else "none (run as Administrator)" if IS_WINDOWS
-            else "afpacket/tcpdump"
-        ),
+        "preferred_backend": preferred,
+        "runtime_deps": runtime,
         "third_party_required": False,
     }

@@ -479,21 +479,24 @@ class ServerTestPage(QWidget):
             self.lbl_detail.setText("Capture folder: {}".format(path))
 
     def _refresh_admin_hint(self):
-        from backend.windows_elevate import is_admin, is_windows
-        if not is_windows():
+        from backend.elevate import is_admin, is_windows, is_macos, capture_backend_hint
+        if not is_windows() and not is_macos():
             self.btn_admin.setVisible(False)
             return
         elevated = is_admin()
         self.btn_admin.setVisible(not elevated)
+        label = "Administrator" if is_windows() else "administrator (root)"
         if elevated:
-            self.lbl_source.setText("Source: {}  ·  Administrator (pktmon / SIO_RCVALL)".format(get_local_ip()))
+            self.lbl_source.setText(
+                "Source: {}  ·  {} ({})".format(get_local_ip(), label, capture_backend_hint())
+            )
         else:
             self.lbl_source.setText(
-                "Source: {}  ·  Not elevated — capture needs Administrator".format(get_local_ip())
+                "Source: {}  ·  Not elevated — capture needs {}".format(get_local_ip(), label)
             )
 
     def _restart_admin(self):
-        from backend.windows_elevate import relaunch_as_admin
+        from backend.elevate import relaunch_as_admin
         ok, err = relaunch_as_admin()
         if ok:
             from PySide6.QtWidgets import QApplication
