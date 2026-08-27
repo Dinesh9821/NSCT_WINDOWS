@@ -4,7 +4,13 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = [('assets', 'assets')]
 binaries = []
-hiddenimports = ['PySide6.QtWebEngineWidgets', 'PySide6.QtWebEngineCore', 'PySide6.QtWebChannel']
+hiddenimports = [
+    'PySide6.QtWebEngineWidgets', 'PySide6.QtWebEngineCore', 'PySide6.QtWebChannel',
+    'backend.windows_pktmon', 'backend.windows_raw_capture', 'backend.windows_elevate',
+    'backend.macos_bpf_capture', 'backend.macos_elevate', 'backend.elevate',
+    'backend.packet_capture', 'backend.pcap_io', 'backend.packet_analysis',
+    'backend.network_verify', 'backend.verification', 'backend.server_checks',
+]
 datas += collect_data_files('certifi')
 tmp_ret = collect_all('PySide6')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]

@@ -6,8 +6,9 @@ requests>=2.31
 pyvis>=0.3.2           # pulls in networkx, jinja2, jsonpickle
 fpdf2>=2.7             # PDF export of the diagnostic report
 
-# Packet capture uses stdlib + OS tools (dumpcap / pktmon / tcpdump / AF_PACKET).
-# No extra Python package is required. Optional if already present:
-#   scapy     — used only when Npcap/libpcap sniffing via scapy is installed
-#   Wireshark/Npcap or Windows pktmon — required on Windows for live frames
+# Packet capture is self-contained (no extra pip packages):
+#   Windows — inbox pktmon (PktMon.sys) then stdlib SOCK_RAW + SIO_RCVALL.
+#             Both need Administrator. pcapng via pktmon etl2pcap or pcap_io.
+#   macOS   — kernel /dev/bpf* then inbox /usr/sbin/tcpdump. Both need root.
+#   No Wireshark, Npcap, dumpcap, or tshark is required at runtime.
 

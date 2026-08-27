@@ -113,6 +113,39 @@ class AnalysisTests(unittest.TestCase):
         finally:
             os.remove(path)
 
+    def test_raw_ip_tcp_handshake_no_ethernet(self):
+        """SIO_RCVALL captures IP datagrams (LINKTYPE_RAW), not Ethernet."""
+        from backend.pcap_io import write_pcapng, LINKTYPE_RAW
+        syn = _ipv4("10.10.10.10", "10.20.20.20", 6, _tcp(40000, 443, 0x02, seq=1))
+        synack = _ipv4("10.20.20.20", "10.10.10.10", 6, _tcp(443, 40000, 0x12, seq=9, ack=2))
+        ack = _ipv4("10.10.10.10", "10.20.20.20", 6, _tcp(40000, 443, 0x10, seq=2, ack=10))
+        fd, path = tempfile.mkstemp(suffix=".pcapng")
+        os.close(fd)
+        write_pcapng(path, [(time.time(), syn), (time.time(), synack), (time.time(), ack)],
+                     linktype=LINKTYPE_RAW)
+        try:
+            a = analyze_pcap(path, "TCP", "10.10.10.10", "10.20.20.20", 443)
+            self.assertEqual(a["packet_count"], 3)
+            self.assertTrue(a["tcp"]["handshake_complete"])
+            self.assertEqual(a["tcp"]["syn"], "YES")
+            self.assertEqual(a["tcp"]["syn_ack"], "YES")
+            self.assertEqual(a["tcp"]["ack"], "YES")
+        finally:
+            os.remove(path)
+
+    def test_empty_capture_is_unknown_not_invented_pass(self):
+        fd, path = tempfile.mkstemp(suffix=".pcapng")
+        os.close(fd)
+        from backend.pcap_io import empty_pcapng
+        empty_pcapng(path)
+        try:
+            a = analyze_pcap(path, "TCP")
+            v = local_verification("TCP", {"ports": [{"state": "open"}], "dns": {"ok": True}}, a)
+            self.assertEqual(v["result"], "UNKNOWN")
+            self.assertIn("INSUFFICIENT_EVIDENCE", v["reason"])
+        finally:
+            os.remove(path)
+
     def test_tcp_syn_only_fail(self):
         syn = _eth(_ipv4("10.10.10.10", "10.20.20.20", 6, _tcp(40000, 443, 0x02)))
         path = _pcap_of([syn])
@@ -172,11 +205,22 @@ class AnalysisTests(unittest.TestCase):
             os.remove(path)
 
 
+class RawIpFilterTests(unittest.TestCase):
+    def test_ip_datagram_filter(self):
+        from backend.windows_raw_capture import ip_datagram_match
+        pkt = _ipv4("192.168.1.37", "8.8.8.8", 6, _tcp(1, 443, 0x02))
+        self.assertTrue(ip_datagram_match(pkt, "8.8.8.8", "TCP", 443))
+        self.assertFalse(ip_datagram_match(pkt, "1.1.1.1", "TCP", 443))
+        self.assertFalse(ip_datagram_match(pkt, "8.8.8.8", "UDP", 443))
+
+
 class FilterTests(unittest.TestCase):
     def test_filter_rejects_injection(self):
         flt = build_capture_filter("10.20.20.20; rm -rf /", "TCP", 443, "10.10.10.10")
         self.assertNotIn("rm", flt)
-        self.assertIn("tcp port 443", build_capture_filter("10.20.20.20", "TCP", 443, "10.10.10.10"))
+        self.assertEqual(
+            build_capture_filter("10.20.20.20", "TCP", 443, "10.10.10.10"),
+            "host 10.20.20.20 and tcp port 443")
         self.assertIn("icmp", build_capture_filter("1.1.1.1", "ICMP", None, "10.10.10.10"))
         self.assertIn("udp port 53", build_capture_filter("8.8.8.8", "UDP", 53, "10.0.0.1"))
 
@@ -188,7 +232,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(interpret_api_response({"status": "FAIL", "message": "blocked"}, local)["result"], "FAIL")
         self.assertEqual(interpret_api_response({"answer": "WARNING: partial"}, local)["result"], "WARNING")
         self.assertEqual(interpret_api_response({"result": "VERIFIED"}, local)["result"], "PASS")
-        self.assertEqual(interpret_api_response({"result": "NOT VERIFIED"}, local)["result"], "FAIL")
+        self.assertEqual(interpret_api_response({"result": "UNKNOWN"}, local)["result"], "UNKNOWN")
+        self.assertEqual(interpret_api_response({"result": "INSUFFICIENT_EVIDENCE"}, local)["result"], "UNKNOWN")
 
     def test_api_failure_keeps_pcap(self):
         syn = _eth(_ipv4("10.10.10.10", "10.20.20.20", 6, _tcp(40000, 443, 0x02)))
@@ -299,6 +344,85 @@ class CaptureUnavailableTests(unittest.TestCase):
         st = capture_status()
         self.assertIn("dumpcap", st)
         self.assertIn("capture_dir", st)
+        self.assertIn("preferred_backend", st)
+        self.assertFalse(st["third_party_required"])
+
+
+class PktmonArgTests(unittest.TestCase):
+    def test_filter_and_etl2pcap_argv(self):
+        from pathlib import Path
+        from backend.windows_pktmon import build_filter_args, etl2pcap_commands
+
+        self.assertEqual(
+            build_filter_args("8.8.8.8", 443, "TCP"),
+            ["-i", "8.8.8.8", "-p", "443", "-t", "TCP"],
+        )
+        self.assertEqual(
+            build_filter_args("8.8.8.8", 0, "ICMP"),
+            ["-i", "8.8.8.8", "-t", "ICMP"],
+        )
+        self.assertIsNone(build_filter_args("google.com", 443, "TCP"))
+        self.assertIsNone(build_filter_args("8.8.8.8; rm", 443, "TCP"))
+        cmds = etl2pcap_commands("pktmon", Path("a.etl"), Path("a.pcapng"))
+        self.assertEqual(cmds[0][:2], ["pktmon", "etl2pcap"])
+        self.assertIn("--out", cmds[0])
+
+
+class ElevateTests(unittest.TestCase):
+    def test_non_windows_relaunch_rejected(self):
+        from backend.windows_elevate import relaunch_as_admin, is_windows
+        if is_windows():
+            self.skipTest("Windows host")
+        ok, err = relaunch_as_admin()
+        self.assertFalse(ok)
+        self.assertIn("Windows", err)
+
+    def test_macos_elevate_rejected_off_darwin(self):
+        from backend.macos_elevate import relaunch_as_admin, is_macos
+        if is_macos():
+            self.skipTest("macOS host")
+        ok, err = relaunch_as_admin()
+        self.assertFalse(ok)
+        self.assertIn("Darwin", err)
+
+
+class MacosBpfTests(unittest.TestCase):
+    def test_parse_bpf_buffer_and_ethernet_match(self):
+        from backend.macos_bpf_capture import (
+            parse_bpf_buffer, bpf_wordalign, dlt_to_linktype, frame_matches,
+            ip_from_frame, DLT_EN10MB, DLT_NULL,
+        )
+        payload = _eth(_ipv4("192.168.1.10", "8.8.8.8", 6, _tcp(1, 443, 0x02)))
+        caplen = len(payload)
+        hdrlen = 26
+        header = (b"\x00" * 16) + struct.pack("<IIH", caplen, caplen, hdrlen)
+        rec = header + payload
+        rec += b"\x00" * (bpf_wordalign(len(rec)) - len(rec))
+        frames = parse_bpf_buffer(rec)
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0], payload)
+        self.assertEqual(dlt_to_linktype(DLT_NULL), 0)
+        self.assertEqual(dlt_to_linktype(DLT_EN10MB), 1)
+        self.assertTrue(frame_matches(payload, DLT_EN10MB, "8.8.8.8", "TCP", 443))
+        self.assertFalse(frame_matches(payload, DLT_EN10MB, "1.1.1.1", "TCP", 443))
+        loop = b"\x02\x00\x00\x00" + _ipv4("127.0.0.1", "127.0.0.1", 1, _icmp(8))
+        self.assertIsNotNone(ip_from_frame(loop, DLT_NULL))
+        self.assertTrue(frame_matches(loop, DLT_NULL, "127.0.0.1", "ICMP", None))
+
+    def test_null_linktype_tcp_handshake(self):
+        from backend.pcap_io import write_pcapng, LINKTYPE_NULL
+        syn = b"\x02\x00\x00\x00" + _ipv4("10.10.10.10", "10.20.20.20", 6, _tcp(40000, 443, 0x02, seq=1))
+        synack = b"\x02\x00\x00\x00" + _ipv4("10.20.20.20", "10.10.10.10", 6, _tcp(443, 40000, 0x12, seq=9, ack=2))
+        ack = b"\x02\x00\x00\x00" + _ipv4("10.10.10.10", "10.20.20.20", 6, _tcp(40000, 443, 0x10, seq=2, ack=10))
+        fd, path = tempfile.mkstemp(suffix=".pcapng")
+        os.close(fd)
+        write_pcapng(path, [(time.time(), syn), (time.time(), synack), (time.time(), ack)],
+                     linktype=LINKTYPE_NULL)
+        try:
+            a = analyze_pcap(path, "TCP", "10.10.10.10", "10.20.20.20", 443)
+            self.assertTrue(a["tcp"]["handshake_complete"])
+        finally:
+            os.remove(path)
 
 
 class ReportTests(unittest.TestCase):

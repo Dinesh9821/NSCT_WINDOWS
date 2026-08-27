@@ -1,17 +1,22 @@
 """
-Windows-first live packet capture.
+Self-contained packet capture for the NSCT app.
 
-Capture begins before the diagnostic and is always stopped in a finally
-block. Backends (in preference order):
+Windows (no Wireshark / Npcap / dumpcap / tshark required at runtime):
+  1. pktmon — inbox PktMon.sys (Administrator). ETL is converted with
+     ``pktmon etl2pcap``. Full frames when the OS supports it.
+  2. SOCK_RAW + SIO_RCVALL — in-process IPv4 datagram capture (Administrator).
+     No Ethernet header; Wireshark LINKTYPE_RAW.
 
-  1. dumpcap  (Wireshark/Npcap) — native pcapng
-  2. pktmon   (Windows 10+)     — ETL converted to pcapng
-  3. tcpdump                    — pcap/pcapng on Unix
-  4. AF_PACKET / NDIS raw       — stdlib sockets + our pcapng writer
-  5. scapy                      — only if already installed
+macOS (no Wireshark required; uses OS facilities only):
+  1. /dev/bpf* — in-process Berkeley Packet Filter (root). Ethernet or DLT_NULL.
+  2. /usr/sbin/tcpdump — Apple inbox tcpdump (root), same kernel BPF.
 
-No extra Python package is required. Missing Npcap/privileges is reported
-without crashing the application.
+Linux:
+  AF_PACKET or tcpdump when the OS provides them.
+
+PCAP/PCAPNG is always written by backend.pcap_io (stdlib) except when pktmon
+writes a native pcapng via etl2pcap. Packets are never synthesized from
+ping/connect output.
 """
 
 from __future__ import annotations
@@ -30,8 +35,8 @@ import subprocess
 import psutil
 
 from core.constants import PACKET_CAPTURE_TIMEOUT, CAPTURE_INTERFACE, capture_dir
-from backend.pcap_io import write_pcapng, file_magic_ok, packet_count, empty_pcapng
-from backend.diagnostics import get_local_ip, _no_window_kwargs, IS_WINDOWS
+from backend.pcap_io import write_pcapng, file_magic_ok, packet_count, empty_pcapng, LINKTYPE_RAW
+from backend.diagnostics import get_local_ip, _no_window_kwargs, IS_WINDOWS, IS_MAC
 
 log = logging.getLogger("NetworkAI.Capture")
 
@@ -70,8 +75,23 @@ def dumpcap_path():
     return None
 
 
+def is_windows_admin():
+    if not IS_WINDOWS:
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
 def tcpdump_path():
-    return shutil.which("tcpdump")
+    found = shutil.which("tcpdump")
+    if IS_MAC:
+        for candidate in (found, "/usr/sbin/tcpdump", "/usr/bin/tcpdump"):
+            if candidate and os.path.isfile(candidate):
+                return candidate
+    return found
 
 
 def pktmon_path():
@@ -84,14 +104,31 @@ def pktmon_path():
     )
 
 
-def detect_interface(source_ip=None):
+def is_elevated():
+    if IS_WINDOWS:
+        return is_windows_admin()
+    try:
+        return os.geteuid() == 0
+    except Exception:
+        return False
+
+
+def detect_interface(source_ip=None, dest_ip=None):
     """Return an OS interface name matching the source IP, if possible."""
     configured = (CAPTURE_INTERFACE or "").strip()
     if configured:
         return configured
+    dest_ip = (dest_ip or "").strip()
+    if dest_ip in ("127.0.0.1", "::1"):
+        if IS_MAC:
+            return "lo0"
+        if not IS_WINDOWS:
+            return "lo"
     source_ip = source_ip or get_local_ip()
     try:
         for name, addrs in psutil.net_if_addrs().items():
+            if _skip_iface(name):
+                continue
             for a in addrs:
                 if a.address == source_ip:
                     return name
@@ -100,11 +137,20 @@ def detect_interface(source_ip=None):
     try:
         stats = psutil.net_if_stats()
         for name, st in stats.items():
-            if st.isup and name and not name.lower().startswith("lo"):
+            if st.isup and name and not _skip_iface(name):
                 return name
     except Exception:
         pass
     return None
+
+
+def _skip_iface(name):
+    n = (name or "").lower()
+    if n.startswith("lo"):
+        return True
+    if n.startswith(("awdl", "llw", "gif", "stf", "anpi")):
+        return True
+    return False
 
 
 def build_capture_filter(dest_ip, protocol=None, port=None, source_ip=None):
@@ -113,9 +159,9 @@ def build_capture_filter(dest_ip, protocol=None, port=None, source_ip=None):
     of the filter expression.
     """
     parts = []
-    if source_ip and _valid_ip(source_ip) and dest_ip and _valid_ip(dest_ip):
-        parts.append("(host %s and host %s)" % (source_ip, dest_ip))
-    elif dest_ip and _valid_ip(dest_ip):
+    if dest_ip and _valid_ip(dest_ip):
+        # Dest-only is more reliable than src AND dest: VPN/NAT and extra A
+        # records would otherwise drop the handshake from the capture.
         parts.append("host %s" % dest_ip)
     proto = (protocol or "").upper()
     if proto == "ICMP":
@@ -192,7 +238,7 @@ class PacketCapture:
         self.protocol = (protocol or "").upper()
         self.port = port
         self.source_ip = source_ip or get_local_ip()
-        self.interface = interface or detect_interface(self.source_ip)
+        self.interface = interface or detect_interface(self.source_ip, dest_ip=dest_ip)
         self.timeout = int(timeout or PACKET_CAPTURE_TIMEOUT)
         self.filter = build_capture_filter(
             dest_ip, protocol=self.protocol, port=port, source_ip=self.source_ip)
@@ -206,18 +252,38 @@ class PacketCapture:
         self._stop = threading.Event()
         self._frames = []
         self._etl = None
-        self._linktype = 1
+        self._linktype = 101 if IS_WINDOWS else 1  # Raw IP on Windows SIO_RCVALL
+        self._raw_engine = None
+        self._pktmon_engine = None
 
     def start(self):
-        log.info("Capture started path=%s filter=%s iface=%s", self.path, self.filter, self.interface)
+        log.info("Capture started path=%s filter=%s iface=%s src=%s admin=%s",
+                 self.path, self.filter, self.interface, self.source_ip, is_elevated())
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        for name, fn in (
-            ("dumpcap", self._start_dumpcap),
-            ("pktmon", self._start_pktmon),
-            ("tcpdump", self._start_tcpdump),
-            ("afpacket", self._start_afpacket),
-            ("scapy", self._start_scapy),
-        ):
+        backends = []
+        if IS_WINDOWS:
+            backends.extend([
+                ("pktmon", self._start_pktmon),
+                ("windows_raw", self._start_windows_raw),
+            ])
+            # Opt-in only: third-party NDIS drivers are not a runtime requirement.
+            if os.environ.get("NETWORKAI_ALLOW_NPCAP") == "1":
+                backends.extend([
+                    ("dumpcap", self._start_dumpcap),
+                    ("npcap", self._start_npcap),
+                    ("scapy", self._start_scapy),
+                ])
+        elif IS_MAC:
+            backends.extend([
+                ("macos_bpf", self._start_macos_bpf),
+                ("tcpdump", self._start_tcpdump),
+            ])
+        else:
+            backends.extend([
+                ("afpacket", self._start_afpacket),
+                ("tcpdump", self._start_tcpdump),
+            ])
+        for name, fn in backends:
             try:
                 if fn():
                     self.backend = name
@@ -243,7 +309,22 @@ class PacketCapture:
                 self._stop_proc()
             elif self.backend == "pktmon":
                 self._stop_pktmon()
-            elif self.backend in ("afpacket", "scapy"):
+            elif self.backend in ("windows_raw", "macos_bpf"):
+                engine = getattr(self, "_raw_engine", None)
+                if engine is not None:
+                    self._frames = engine.stop()
+                    if getattr(engine, "linktype", None) is not None:
+                        self._linktype = engine.linktype
+                    self._raw_engine = None
+                    self._thread = None
+                try:
+                    lt = self._linktype
+                    if lt is None:
+                        lt = LINKTYPE_RAW if IS_WINDOWS else 1
+                    write_pcapng(self.path, list(self._frames), linktype=lt)
+                except Exception:
+                    log.exception("failed to write pcapng")
+            elif self.backend in ("afpacket", "scapy", "npcap"):
                 self._stop.set()
                 if self._thread:
                     self._thread.join(timeout=5)
@@ -293,32 +374,163 @@ class PacketCapture:
 
     def _unavailable_message(self):
         if IS_WINDOWS:
-            np = "installed" if npcap_installed() else "not installed"
+            admin = is_windows_admin()
             return (
-                "Packet capture unavailable. On Windows this requires Npcap "
-                "(bundled with Wireshark) or an elevated pktmon session. "
-                "Npcap is %s. Run the app as Administrator if capture is "
-                "installed but still fails. Network diagnostics will continue."
-            ) % np
+                "Packet capture unavailable. This build does not use Wireshark, "
+                "Npcap, dumpcap, or tshark. On Windows, real IP datagrams are "
+                "observed with a raw socket (SIO_RCVALL) or inbox pktmon, both "
+                "of which require Administrator. This process is elevated: %s. "
+                "Use Restart as Administrator on Server Test if that is False. "
+                "Ethernet-level sniffing of a NIC is not possible in user mode "
+                "without an NDIS filter driver (a Windows architectural limit). "
+                "Network diagnostics will continue; the PCAP may be empty."
+            ) % admin
+        if IS_MAC:
+            return (
+                "Packet capture unavailable. This build does not use Wireshark. "
+                "On macOS, live frames are observed with /dev/bpf (kernel BPF) or "
+                "inbox /usr/sbin/tcpdump — both need administrator (root). "
+                "This process is elevated: %s. Use Restart as Administrator on "
+                "Server Test if that is False. Diagnostics will continue; the "
+                "PCAP may be empty."
+            ) % is_elevated()
         return (
             "Packet capture unavailable (permission or backend missing). "
             "Install tcpdump or run with CAP_NET_RAW. Diagnostics will continue."
         )
 
+    def _start_windows_raw(self):
+        if not IS_WINDOWS:
+            return False
+        from backend.windows_raw_capture import WindowsRawCapture
+        cap = WindowsRawCapture(
+            self.source_ip, dest_ip=self.dest_ip, protocol=self.protocol,
+            port=self.port, timeout=self.timeout)
+        try:
+            cap.start()
+        except PermissionError as e:
+            log.info("Windows raw capture not permitted: %s", e)
+            return False
+        except OSError as e:
+            log.info("Windows raw capture socket failed: %s", e)
+            return False
+        self._raw_engine = cap
+        self._stop.clear()
+        self._frames = cap.frames
+        self._linktype = LINKTYPE_RAW
+        # Reader thread lives inside WindowsRawCapture.
+        self._thread = cap._thread
+        return True
+
+    def _start_macos_bpf(self):
+        if not IS_MAC:
+            return False
+        from backend.macos_bpf_capture import MacosBpfCapture
+        cap = MacosBpfCapture(
+            self.interface, dest_ip=self.dest_ip, protocol=self.protocol,
+            port=self.port, timeout=self.timeout)
+        try:
+            cap.start()
+        except PermissionError as e:
+            log.info("macOS BPF capture not permitted: %s", e)
+            return False
+        except OSError as e:
+            log.info("macOS BPF capture failed: %s", e)
+            return False
+        self._raw_engine = cap
+        self._stop.clear()
+        self._frames = cap.frames
+        self._linktype = cap.linktype if cap.linktype is not None else 1
+        self._thread = cap._thread
+        return True
+
+    def _pcap_device(self):
+        """Npcap/dumpcap device name (\\Device\\NPF_{GUID}), not 'Wi-Fi'."""
+        if not IS_WINDOWS:
+            return self.interface
+        try:
+            from backend.npcap_wpcap import resolve_pcap_device
+            name, devices = resolve_pcap_device(self.interface, self.source_ip)
+            log.info("Npcap devices=%s selected=%s (friendly=%s)",
+                     [(d.get("description"), d.get("ips")) for d in devices],
+                     name, self.interface)
+            return name or self.interface
+        except Exception:
+            log.warning("Npcap device listing failed", exc_info=True)
+            return self.interface
+
     # ----- dumpcap --------------------------------------------------------
     def _start_dumpcap(self):
         exe = dumpcap_path()
         if not exe:
+            log.info("dumpcap not found (install Wireshark, or rely on Npcap wpcap)")
             return False
         args = [exe, "-q", "-w", self.path]
-        iface = self.interface
-        if iface and _IFACE.match(iface):
-            args.extend(["-i", iface])
+        device = self._pcap_device()
+        if device:
+            args.extend(["-i", device])
+        elif not IS_WINDOWS:
+            args.extend(["-i", "any"])
         else:
-            args.extend(["-i", "any"] if not IS_WINDOWS else ["-i", "1"])
+            args.extend(["-i", "1"])
         if self.filter:
             args.extend(["-f", self.filter])
         return self._spawn(args)
+
+    # ----- Npcap wpcap.dll ------------------------------------------------
+    def _start_npcap(self):
+        if not IS_WINDOWS:
+            return False
+        try:
+            from backend.npcap_wpcap import NpcapLive, load_wpcap
+        except Exception:
+            log.warning("npcap module import failed", exc_info=True)
+            return False
+        if load_wpcap() is None:
+            log.info("Npcap wpcap.dll could not be loaded")
+            return False
+        device = self._pcap_device()
+        if not device:
+            log.info("No Npcap capture device matched interface %s", self.interface)
+            return False
+        live = NpcapLive()
+        try:
+            live.open(device, bpf=self.filter)
+        except Exception as e:
+            log.info("Npcap open failed on %s: %s", device, e)
+            try:
+                live.close()
+            except Exception:
+                pass
+            return False
+        self._stop.clear()
+        self._frames = []
+        self._linktype = live.linktype or 1
+
+        def _loop():
+            try:
+                deadline = time.time() + self.timeout
+                while not self._stop.is_set() and time.time() < deadline:
+                    try:
+                        pkt = live.next_packet()
+                    except Exception as exc:
+                        log.warning("Npcap read error: %s", exc)
+                        break
+                    if not pkt:
+                        continue
+                    ts, data = pkt
+                    if live.filtered or _userspace_match(
+                            data, self.dest_ip, self.protocol, self.port, self.source_ip):
+                        self._frames.append((ts, data))
+            finally:
+                try:
+                    live.close()
+                except Exception:
+                    pass
+
+        self._thread = threading.Thread(target=_loop, name="npcap-capture", daemon=True)
+        self._thread.start()
+        return True
 
     # ----- tcpdump --------------------------------------------------------
     def _start_tcpdump(self):
@@ -328,6 +540,8 @@ class PacketCapture:
         iface_args = []
         if self.interface and _IFACE.match(self.interface):
             iface_args = ["-i", self.interface]
+        elif IS_MAC:
+            iface_args = ["-i", "en0"]
         else:
             iface_args = ["-i", "any"]
         filt = [self.filter] if self.filter else []
@@ -409,55 +623,43 @@ class PacketCapture:
         except Exception:
             pass
 
-    # ----- pktmon (Windows) -----------------------------------------------
+    # ----- pktmon (Windows inbox PktMon.sys) ------------------------------
     def _start_pktmon(self):
-        exe = pktmon_path()
-        if not exe:
+        from pathlib import Path
+        from backend.windows_pktmon import WindowsPktmonCapture
+
+        if not IS_WINDOWS:
             return False
-        self._etl = self.path + ".etl"
-        # Reset filters (best-effort); ignore failures.
-        _run_hidden([exe, "filter", "remove"])
-        filt = [exe, "filter", "add"]
-        if self.dest_ip and _valid_ip(self.dest_ip):
-            if ":" in self.dest_ip:
-                filt.extend(["--ipv6", self.dest_ip])
-            else:
-                filt.extend(["-i", self.dest_ip])
-        proto = self.protocol
-        if proto in ("TCP", "UDP", "ICMP"):
-            filt.extend(["-t", proto])
-        if _valid_port(self.port) and proto in ("TCP", "UDP"):
-            filt.extend(["-p", str(int(self.port))])
-        code, _o, err = _run_hidden(filt, timeout=15)
-        if code not in (0, None) and b"error" in (err or b"").lower():
-            log.warning("pktmon filter add: %s", err[:300])
-        args = [exe, "start", "--capture", "--pkt-size", "0", "--file-name", self._etl]
-        code, _o, err = _run_hidden(args, timeout=15)
-        if code != 0:
-            log.info("pktmon start failed (%s): %s", code, (err or b"")[:300])
-            _run_hidden([exe, "stop"], timeout=10)
+        if not is_windows_admin():
+            log.info("Skipping pktmon (Access denied unless the app is Run as Administrator)")
             return False
+        engine = WindowsPktmonCapture(
+            Path(self.path),
+            self.dest_ip or "",
+            int(self.port or 0),
+            self.protocol or "TCP",
+        )
+        ok, err = engine.start()
+        if not ok:
+            log.info("pktmon start skipped/failed: %s", err)
+            return False
+        self._pktmon_engine = engine
+        self._linktype = 1
         return True
 
     def _stop_pktmon(self):
-        exe = pktmon_path()
-        if exe:
-            _run_hidden([exe, "stop"], timeout=20)
-            etl = self._etl
-            if etl and os.path.isfile(etl):
-                code, _o, err = _run_hidden(
-                    [exe, "pcapng", etl, "-o", self.path], timeout=30)
-                if code != 0:
-                    log.warning("pktmon pcapng convert failed: %s", (err or b"")[:300])
-                try:
-                    os.remove(etl)
-                except OSError:
-                    pass
-            _run_hidden([exe, "filter", "remove"], timeout=10)
+        engine = self._pktmon_engine
+        self._pktmon_engine = None
+        if engine is None:
+            return
+        _size, err = engine.stop_and_convert()
+        if err:
+            log.warning("pktmon convert: %s", err)
+            self.error = err
 
     # ----- AF_PACKET / raw (userspace filter) -----------------------------
     def _start_afpacket(self):
-        if IS_WINDOWS:
+        if IS_WINDOWS or IS_MAC or not hasattr(socket, "AF_PACKET"):
             return False
         try:
             sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
@@ -565,13 +767,36 @@ def _userspace_match(frame, dest_ip, protocol, port, source_ip):
 
 def capture_status():
     """Lightweight capability probe for Settings / error messages."""
+    pktmon = bool(pktmon_path())
+    admin = is_elevated()
+    if IS_WINDOWS:
+        preferred = (
+            "pktmon" if (admin and pktmon)
+            else "windows_raw" if admin
+            else "none (run as Administrator)"
+        )
+        runtime = "none (Windows uses inbox pktmon + SIO_RCVALL)"
+    elif IS_MAC:
+        preferred = (
+            "macos_bpf" if admin
+            else "none (run as Administrator)"
+        )
+        runtime = "none (macOS uses /dev/bpf + inbox /usr/sbin/tcpdump)"
+    else:
+        preferred = "afpacket/tcpdump"
+        runtime = "none (AF_PACKET or tcpdump)"
     return {
         "npcap": npcap_installed(),
         "dumpcap": bool(dumpcap_path()),
-        "pktmon": bool(pktmon_path()),
+        "pktmon": pktmon,
         "tcpdump": bool(tcpdump_path()),
         "interface": detect_interface(),
         "capture_dir": capture_dir(),
         "windows": IS_WINDOWS,
-        "admin_hint": IS_WINDOWS,
+        "macos": IS_MAC,
+        "admin": admin,
+        "dumpcap_path": dumpcap_path(),
+        "preferred_backend": preferred,
+        "runtime_deps": runtime,
+        "third_party_required": False,
     }

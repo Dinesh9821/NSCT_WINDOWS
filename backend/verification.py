@@ -43,6 +43,21 @@ def local_verification(protocol, diagnostic, analysis):
     icmp = (analysis or {}).get("icmp") or {}
     udp = (analysis or {}).get("udp") or {}
     pkt_n = (analysis or {}).get("packet_count") or 0
+    if pkt_n == 0:
+        rec = _verdict(
+            "UNKNOWN",
+            "INSUFFICIENT_EVIDENCE: no packets were present in the capture file, "
+            "so the diagnostic cannot be corroborated by packet evidence.",
+            expected="Observed frames for the selected protocol",
+            actual="packet_count=0 capture_error=%s" % ((analysis or {}).get("error") or "none"),
+            recommendation=(
+                "Run the application as Administrator so Windows can observe IP "
+                "datagrams with a raw socket (SIO_RCVALL). Do not infer a handshake "
+                "or a firewall drop from an empty PCAP."
+            ),
+        )
+        rec["result"] = "UNKNOWN"
+        return rec
 
     if protocol == "TCP":
         ports = (diagnostic or {}).get("ports") or []
@@ -209,6 +224,8 @@ def _classify_text(text):
     if "NOT VERIFIED" in u or re.search(r"\bFAILED\b", u):
         return "FAIL"
     tokens = set(re.findall(r"[A-Z]+", u))
+    if tokens & {"UNKNOWN"} or "INSUFFICIENT" in u:
+        return "UNKNOWN"
     if tokens & {"FAIL", "FAILED", "BLOCKED", "FILTERED"}:
         return "FAIL"
     if tokens & {"WARNING", "WARN", "PARTIAL"}:

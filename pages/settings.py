@@ -52,12 +52,17 @@ class SettingsPage(QWidget):
             ("Auth User", USERNAME),
             ("Auth Secret", "•" * 8),
         ])
+        from backend.packet_capture import capture_status
+        st = capture_status()
         self._build_card("Packet capture & verification", [
             ("Verification API", VERIFY_API_URL or "(not configured)"),
             ("API timeout", "{} s".format(VERIFY_API_TIMEOUT)),
             ("Capture timeout", "{} s".format(PACKET_CAPTURE_TIMEOUT)),
             ("Capture folder", capture_dir()),
             ("PCAP retention", "{} files".format(PCAP_RETENTION)),
+            ("Administrator", "yes" if st.get("admin") else "no"),
+            ("Preferred capture", st.get("preferred_backend") or "—"),
+            ("Runtime deps", st.get("runtime_deps") or "none"),
         ])
         self._build_card("System", [
             ("Hostname", socket.gethostname()),

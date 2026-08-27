@@ -4,6 +4,7 @@ Application-wide constants and configuration.
 """
 
 import os
+import sys
 import tempfile
 
 APP_NAME = "Device and Network Tool"
@@ -48,6 +49,7 @@ VERIFY_API_PASSWORD = _env("NETWORKAI_VERIFY_API_PASSWORD", PASSWORD)
 PACKET_CAPTURE_TIMEOUT = _env_int("NETWORKAI_CAPTURE_TIMEOUT", 45)
 CAPTURE_INTERFACE = _env("NETWORKAI_CAPTURE_INTERFACE", "")  # empty = auto-detect
 PCAP_RETENTION = _env_int("NETWORKAI_PCAP_RETENTION", 50)
+CAPTURE_MAX_PACKETS = _env_int("NETWORKAI_CAPTURE_MAX_PACKETS", 50000)
 
 
 def capture_dir():
@@ -76,7 +78,12 @@ DEFAULT_ANIMATION_DURATION = 250  # milliseconds
 
 def log_dir():
     """Writable folder for logs (per-user, cross-platform)."""
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~") or tempfile.gettempdir()
+    if os.environ.get("LOCALAPPDATA"):
+        base = os.environ["LOCALAPPDATA"]
+    elif sys.platform == "darwin":
+        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+    else:
+        base = os.path.expanduser("~") or tempfile.gettempdir()
     folder = os.path.join(base, "NetworkAIEnterprise")
     try:
         os.makedirs(folder, exist_ok=True)
